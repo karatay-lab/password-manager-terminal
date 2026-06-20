@@ -100,20 +100,21 @@ UUID). We port `src/bin/test_sender.rs` directly.
 - All network + crypto runs **off the UI thread**; results return as `Message`s.
 - `view` is pure; `update` mutates Model and may emit commands.
 
-**❓DECIDE — async vs threads:** `tokio` + `reqwest` (async) **or** worker thread +
-blocking `ureq`? (Crypto/argon2 is CPU-bound either way → run on a blocking task/
-thread regardless.)
+**✅ DECIDED (M2) — async:** `tokio` + `reqwest` (rustls). The api layer is `async`;
+results return to the UI thread as `Message`s. (Crypto/argon2 is CPU-bound → run on a
+blocking task/thread regardless.)
 
 ## 6. Local credential store & unlock
 
 The device token + X25519 private key are long-lived secrets that must survive
 restarts but never sit in plaintext on disk.
 
-**❓DECIDE — store strategy:**
-- **A) OS keyring** (`keyring` crate): no app passphrase, relies on the OS session.
-- **B) Passphrase-encrypted file** (`argon2` → key → AES-256-GCM file in
-  `PWM_DATA_DIR`): a local "master password" unlocks the app each launch.
-- **C) Both:** keyring by default, passphrase fallback on headless boxes.
+**✅ DECIDED (M2) — store strategy: B) Passphrase-encrypted file.** Master passphrase
+→ Argon2id → AES-256-GCM file (`<PWM_DATA_DIR>/store.enc`, `0600`). Chosen over the OS
+keyring (A) because the target runs **headless** — no Secret Service to rely on — and
+this is the conventional model for a password manager. Implemented in `src/store.rs`.
+- ~~A) OS keyring~~ — needs an OS session/Secret Service; absent on headless boxes.
+- ~~C) Both~~ — more code paths than v1 needs; revisit if a desktop build appears.
 
 Either way: `secrecy::SecretString` in memory, `zeroize` on drop, no logging of
 secrets, clipboard auto-clear (`PWM_CLIPBOARD_CLEAR_SECS`, default 30s).
@@ -184,6 +185,10 @@ src/
 - **M1 — crypto core:** `crypto.rs` (port `test_sender.rs`) + a round-trip test, and
   ideally an integration test that seals→sends→reads back against a local backend.
 - **M2 — enrollment:** greet → register → approval-poll → store persisted/encrypted.
+  - ✅ `src/api/` (reqwest client, `auth::{greet,register,verify}`, models, error mapping)
+    and `src/store.rs` (Argon2id + AES-256-GCM, `0600`, atomic write, zeroize) landed
+    with unit tests. **Remaining for M3:** wire the tokio runtime + the enroll/approval
+    *screen* (UI + message/command plumbing) that drives these against a live backend.
 - **M3 — session:** unlock store, verify, re-sign fallback.
 - **M4 — read:** groups list, pwd list (valid/expired), get + decrypt + detail view.
 - **M5 — write:** create + update + group create (renew = create-new, see §8).
@@ -193,9 +198,9 @@ src/
 ## 11. Open questions (consolidated)
 
 - [x] ~~Crypto/wire interop~~ — **RESOLVED** from backend source (`docs/protocol-notes.md`).
+- [x] ~~async (tokio) vs threads~~ — **DECIDED (M2): tokio + reqwest** (§5).
+- [x] ~~local store: keyring vs passphrase vs both~~ — **DECIDED (M2): passphrase + Argon2id** (§6).
 - [ ] v1 scope cuts (§2)
-- [ ] async (tokio) vs threads (§5)
-- [ ] local store: keyring vs passphrase vs both (§6)
 - [ ] idle auto-lock in v1? (§6)
 - [ ] keymap style (§8)
 - [ ] `pwd` JSON schema fields — confirm `{username,password,url,notes}` is what we want.
@@ -204,5 +209,7 @@ src/
 
 ### Next step
 
-Crypto is unblocked. Pick the
-**❓DECIDE** defaults and lock M0's `Cargo.toml` + skeleton.
+M0–M2 landed (scaffold, crypto core, enrollment api + encrypted store). **M3 — session:**
+wire the tokio runtime into the app, build the enroll/approval and unlock *screens*, and
+drive `auth::{greet,register,verify}` + `Store` against a live backend (verify → re-sign
+fallback on 401). Open UI decision to make then: **keymap style** (§8).

@@ -4,6 +4,8 @@
 //! around [`app::App`]. Splitting lib/bin keeps modules built ahead of their first
 //! use (e.g. `crypto` in M1) part of the public API rather than dead code.
 
+pub mod api;
 pub mod app;
 pub mod config;
 pub mod crypto;
+pub mod store;

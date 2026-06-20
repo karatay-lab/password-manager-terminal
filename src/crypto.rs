@@ -117,18 +117,16 @@ mod tests {
     fn rfc7748_known_answer() {
         // RFC 7748 §6.1 test vector. The bare x25519() clamps the scalar, so the
         // unclamped private keys below produce the published public keys + secret.
-        let a_priv: [u8; 32] = hex::decode(
-            "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
-        )
-        .unwrap()
-        .try_into()
-        .unwrap();
-        let b_priv: [u8; 32] = hex::decode(
-            "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
-        )
-        .unwrap()
-        .try_into()
-        .unwrap();
+        let a_priv: [u8; 32] =
+            hex::decode("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let b_priv: [u8; 32] =
+            hex::decode("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+                .unwrap()
+                .try_into()
+                .unwrap();
         let a_pub = x25519_dalek::x25519(a_priv, X25519_BASEPOINT);
         let b_pub = x25519_dalek::x25519(b_priv, X25519_BASEPOINT);
         assert_eq!(
@@ -189,7 +187,10 @@ mod tests {
 
     #[test]
     fn open_hex_rejects_bad_hex() {
-        assert!(matches!(open_hex("zz", &[0u8; 32]), Err(CryptoError::Hex(_))));
+        assert!(matches!(
+            open_hex("zz", &[0u8; 32]),
+            Err(CryptoError::Hex(_))
+        ));
     }
 
     #[test]

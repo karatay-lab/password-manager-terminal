@@ -14,4 +14,15 @@ dotenvy = "0.15"          # load .env at startup
 x25519-dalek = "2"        # X25519 ECDH
 aes-gcm = "0.10"          # AES-256-GCM (also provides OsRng via aead)
 hex = "0.4"               # wire encoding for sealed blobs / public keys
-thiserror = "2"           # typed crypto errors
+thiserror = "2"           # typed crypto / api / store errors
+
+# enrollment (M2) — HTTP client + encrypted local store
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] } # async runtime
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] } # HTTP (rustls, no OpenSSL)
+serde = { version = "1", features = ["derive"] } # (de)serialize wire DTOs + local store
+serde_json = "1"          # JSON bodies + store serialization
+argon2 = "0.5"            # passphrase KDF for the at-rest store key
+zeroize = { version = "1", features = ["derive"] } # wipe secrets from memory on drop
+
+[dev-dependencies]
+tempfile = "3"            # isolated temp dirs for store round-trip tests
