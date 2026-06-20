@@ -1,10 +1,7 @@
-mod app;
-mod config;
-
 use color_eyre::Result;
 
-use crate::app::App;
-use crate::config::Config;
+use pwd_manager_terminal::app::App;
+use pwd_manager_terminal::config::Config;
 
 fn main() -> Result<()> {
     // Install color-eyre first so ratatui's panic hook wraps it: on a panic the
