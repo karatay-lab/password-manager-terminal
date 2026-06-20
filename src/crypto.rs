@@ -54,6 +54,16 @@ pub fn generate_keypair() -> KeyPair {
     KeyPair { private, public }
 }
 
+/// Generate a random 128-bit secret as a 32-char lowercase hex string.
+///
+/// Used to mint the client-chosen `device_token` and `ehlo_secret` at enrollment
+/// (the backend accepts any UTF-8 string; we want unguessable ones).
+pub fn random_token() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 /// Derive the shared secret via ECDH: `x25519(my_private, peer_public)`.
 ///
 /// The raw output is the AES-256 key. Both sides compute the same value
@@ -191,6 +201,15 @@ mod tests {
             open_hex("zz", &[0u8; 32]),
             Err(CryptoError::Hex(_))
         ));
+    }
+
+    #[test]
+    fn random_token_is_32_hex_chars_and_unique() {
+        let a = random_token();
+        let b = random_token();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
     }
 
     #[test]

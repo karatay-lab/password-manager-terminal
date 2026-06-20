@@ -8,4 +8,6 @@ pub mod api;
 pub mod app;
 pub mod config;
 pub mod crypto;
+pub mod message;
 pub mod store;
+pub mod ui;

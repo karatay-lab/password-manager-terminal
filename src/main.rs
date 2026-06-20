@@ -12,8 +12,12 @@ fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     let config = Config::from_env();
 
+    // Build the app (HTTP client, runtime, store) before entering raw mode so an
+    // early failure prints normally instead of on a half-initialized terminal.
+    let app = App::new(config)?;
+
     let terminal = ratatui::init();
-    let result = App::new(config).run(terminal);
+    let result = app.run(terminal);
     ratatui::restore();
     result
 }

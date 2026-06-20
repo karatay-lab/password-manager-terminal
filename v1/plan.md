@@ -166,7 +166,9 @@ src/
 7. **Status/help bar:** keybindings + transient errors (map generic `401 unauthorized`
    to a helpful "device not approved / IP changed?" hint).
 
-**❓DECIDE — keymap:** vim-style (`hjkl`, `:`) or arrow/letter style?
+**✅ DECIDED (M3) — keymap: arrow/letter style.** Arrows/Enter to navigate, `Esc`
+to go back/quit, single-letter actions (`n` new, `e` edit, `c` copy, `r` re-sign,
+`w` wait). Lower learning curve than vim-style for the target users.
 
 ## 9. Error handling specifics
 
@@ -190,6 +192,13 @@ src/
     with unit tests. **Remaining for M3:** wire the tokio runtime + the enroll/approval
     *screen* (UI + message/command plumbing) that drives these against a live backend.
 - **M3 — session:** unlock store, verify, re-sign fallback.
+  - ✅ tokio runtime wired into the app as a sync-UI/async-task bridge (`Message`/
+    `Command` channel; `update` is pure-ish and unit-tested). Screens: **Enroll**
+    (passphrase → keygen → greet/register → save), **Awaiting approval** (debounced
+    `/verify` poll), **Unlock** (passphrase → decrypt → `/verify`), and a **Re-sign
+    prompt** on 401 (drives `auth::re_sign`). `crypto::random_token`,
+    `auth::re_sign` + `ReSignRequest` landed. **Pending:** end-to-end run against a
+    live backend (no backend available in dev here) — logic is unit-tested only.
 - **M4 — read:** groups list, pwd list (valid/expired), get + decrypt + detail view.
 - **M5 — write:** create + update + group create (renew = create-new, see §8).
 - **M6 — secure copy & polish:** clipboard auto-clear, zeroize audit, search, help,
@@ -200,16 +209,17 @@ src/
 - [x] ~~Crypto/wire interop~~ — **RESOLVED** from backend source (`docs/protocol-notes.md`).
 - [x] ~~async (tokio) vs threads~~ — **DECIDED (M2): tokio + reqwest** (§5).
 - [x] ~~local store: keyring vs passphrase vs both~~ — **DECIDED (M2): passphrase + Argon2id** (§6).
+- [x] ~~keymap style~~ — **DECIDED (M3): arrow/letter style** (§8).
 - [ ] v1 scope cuts (§2)
 - [ ] idle auto-lock in v1? (§6)
-- [ ] keymap style (§8)
 - [ ] `pwd` JSON schema fields — confirm `{username,password,url,notes}` is what we want.
 
 ---
 
 ### Next step
 
-M0–M2 landed (scaffold, crypto core, enrollment api + encrypted store). **M3 — session:**
-wire the tokio runtime into the app, build the enroll/approval and unlock *screens*, and
-drive `auth::{greet,register,verify}` + `Store` against a live backend (verify → re-sign
-fallback on 401). Open UI decision to make then: **keymap style** (§8).
+M0–M3 landed (scaffold, crypto core, enrollment api + encrypted store, and the live
+session loop: enroll/approval/unlock/re-sign screens on a tokio bridge). **M4 — read:**
+groups list, password list (valid/expired), and `GET /pwd/get/{uuid}` → decrypt → a
+detail view. First decision there: confirm the `pwd` JSON schema `{username,password,
+url,notes}` (§11) before building the seal/open of real entries.

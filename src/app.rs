@@ -1,80 +1,706 @@
+//! The application model, event loop, and async bridge (The Elm Architecture).
+//!
+//! The UI loop stays **synchronous**: it draws a frame, then waits a short tick for
+//! a key press. All network + blocking crypto runs on a tokio [`Runtime`]; each
+//! [`Command`] is spawned as a task that reports back through an `mpsc` channel as a
+//! [`Message`]. `update` is the pure-ish core — it mutates the model and returns the
+//! commands to run, which makes the state machine unit-testable without a backend.
+//!
+//! Flows (plan §8):
+//! - **Enroll** (no local store): set a master passphrase → greet/register → poll
+//!   `/verify` on the *awaiting-approval* screen until an admin approves.
+//! - **Unlock** (store exists): passphrase → decrypt → `/verify`; on 401 offer
+//!   `/re-sign` (re-binds the IP, but needs admin re-approval).
+
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Duration;
+
 use color_eyre::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::Stylize;
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Padding, Paragraph};
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::DefaultTerminal;
+use tokio::runtime::Runtime;
+use zeroize::Zeroize;
 
+use crate::api::{auth, ApiClient, ApiError};
 use crate::config::Config;
+use crate::crypto;
+use crate::message::{Command, Message};
+use crate::store::{Store, StoreError, StoreState};
+use crate::ui;
 
-/// Top-level application state.
+/// How often to re-poll `/verify` while waiting for admin approval. The backend
+/// allows `verify` at 10 rps; this is deliberately gentle (plan §9, debounce).
+const POLL_INTERVAL_MS: u64 = 3000;
+/// Max time we block for a key press before looping to drain async results.
+const EVENT_TICK: Duration = Duration::from_millis(100);
+/// Minimum master-passphrase length accepted at enrollment.
+const MIN_PASSPHRASE_LEN: usize = 8;
+
+/// Which screen is currently shown (and therefore how input is interpreted).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Screen {
+    /// A store exists: prompt for the master passphrase to decrypt it.
+    Unlock,
+    /// No store yet: choose a master passphrase and enroll.
+    Enroll,
+    /// A blocking step is in flight after unlock (verifying with the server).
+    Connecting,
+    /// Registered/re-signed but unconfirmed: polling `/verify` for approval.
+    AwaitingApproval,
+    /// `/verify` returned 401 after unlock — offer re-sign or keep waiting.
+    ReSignPrompt,
+    /// Approved and connected. (Vault browsing lands in M4.)
+    Ready,
+}
+
+/// Which field the enroll form's cursor is on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EnrollField {
+    Passphrase,
+    Confirm,
+}
+
+/// Severity of the status-line message, used only for colour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatusKind {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+/// A one-line message shown at the bottom of the screen.
+#[derive(Clone)]
+pub struct Status {
+    pub text: String,
+    pub kind: StatusKind,
+}
+
+impl Status {
+    fn info(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: StatusKind::Info,
+        }
+    }
+    fn success(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: StatusKind::Success,
+        }
+    }
+    fn warning(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: StatusKind::Warning,
+        }
+    }
+    fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: StatusKind::Error,
+        }
+    }
+}
+
+/// Top-level application state (the Model).
 ///
-/// M0 is intentionally minimal: render one frame and quit. Screens (Sign-in,
-/// Vault, Entry) and the message/update loop arrive in later milestones.
+/// Fields read by the renderer are `pub`; the identity (secrets) stays private and
+/// is only touched by [`App::dispatch`] when building a command's task.
 pub struct App {
-    config: Config,
+    pub config: Config,
+    pub screen: Screen,
+    /// Primary text field (passphrase on both entry screens).
+    pub input: String,
+    /// Confirm field (enroll only).
+    pub confirm: String,
+    pub enroll_field: EnrollField,
+    pub status: Status,
+    /// A command is in flight; entry screens ignore input while set.
+    pub busy: bool,
+    /// `/verify` has passed at least once this session.
+    pub verified: bool,
+
+    /// The unlocked/enrolled identity. Secret — never rendered.
+    identity: Option<StoreState>,
+    api: ApiClient,
+    store: Store,
+    runtime: Runtime,
+    tx: Sender<Message>,
+    rx: Receiver<Message>,
     running: bool,
 }
 
 impl App {
-    pub fn new(config: Config) -> Self {
-        Self {
+    /// Build the app: HTTP client, store handle, tokio runtime, and the message
+    /// channel. The starting screen depends on whether a local store exists.
+    pub fn new(config: Config) -> Result<Self> {
+        let api = ApiClient::new(&config)?;
+        let store = Store::new(&config);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let (tx, rx) = mpsc::channel();
+
+        let enrolled = store.exists();
+        let (screen, status) = if enrolled {
+            (
+                Screen::Unlock,
+                Status::info("Enter your master passphrase to unlock."),
+            )
+        } else {
+            (
+                Screen::Enroll,
+                Status::info("No identity yet — set a master passphrase to enroll this device."),
+            )
+        };
+
+        Ok(Self {
             config,
+            screen,
+            input: String::new(),
+            confirm: String::new(),
+            enroll_field: EnrollField::Passphrase,
+            status,
+            busy: false,
+            verified: false,
+            identity: None,
+            api,
+            store,
+            runtime,
+            tx,
+            rx,
             running: false,
-        }
+        })
     }
 
-    /// Draw/event loop: redraw, then block for input, until the user quits.
+    /// Draw → wait for input (with a tick) → drain async results, until quit.
     pub fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
         self.running = true;
         while self.running {
-            terminal.draw(|frame| self.draw(frame))?;
-            self.handle_events()?;
-        }
-        Ok(())
-    }
+            terminal.draw(|frame| ui::view(&self, frame))?;
 
-    fn draw(&self, frame: &mut Frame) {
-        let [title, body, status] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .areas(frame.area());
+            if event::poll(EVENT_TICK)? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press {
+                        self.handle(Message::Key(key));
+                    }
+                }
+            }
 
-        frame.render_widget(Line::from(" pwd-manager ".bold().reversed()), title);
-
-        let block = Block::bordered()
-            .title(" pwd-manager-terminal ")
-            .padding(Padding::uniform(1));
-        let lines = vec![
-            "Scaffold ready (M0).".bold().into(),
-            Line::raw(""),
-            Line::raw(format!("Backend: {}", self.config.api_base_url)),
-            Line::raw(format!("Store:   {}", self.config.data_dir)),
-            Line::raw(""),
-            "Screens to come: Sign-in · Vault · Entry.".dim().into(),
-        ];
-        frame.render_widget(Paragraph::new(lines).block(block), body);
-
-        frame.render_widget(Line::from(" q/Esc quit ".dim()).centered(), status);
-    }
-
-    fn handle_events(&mut self) -> Result<()> {
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                self.on_key(key);
+            // Drain into a buffer first so the rx borrow ends before we mutate self.
+            let mut pending = Vec::new();
+            while let Ok(msg) = self.rx.try_recv() {
+                pending.push(msg);
+            }
+            for msg in pending {
+                self.handle(msg);
             }
         }
         Ok(())
     }
 
-    fn on_key(&mut self, key: KeyEvent) {
-        match (key.modifiers, key.code) {
-            (_, KeyCode::Char('q') | KeyCode::Esc) => self.running = false,
-            (KeyModifiers::CONTROL, KeyCode::Char('c')) => self.running = false,
-            _ => {}
+    /// Apply a message, then run any commands it produced.
+    fn handle(&mut self, msg: Message) {
+        for cmd in self.update(msg) {
+            self.dispatch(cmd);
         }
+    }
+
+    /// Pure-ish state transition: mutate the model, return commands to run.
+    fn update(&mut self, msg: Message) -> Vec<Command> {
+        match msg {
+            Message::Key(key) => self.on_key(key),
+
+            Message::Unlocked(state) => {
+                self.identity = Some(*state);
+                self.busy = false;
+                self.screen = Screen::Connecting;
+                self.status = Status::info("Verifying with the server…");
+                vec![Command::Verify { delay_ms: 0 }]
+            }
+            Message::UnlockFailed(err) => {
+                self.busy = false;
+                self.status = Status::error(err);
+                vec![]
+            }
+
+            Message::Enrolled(state) => {
+                self.identity = Some(*state);
+                self.busy = false;
+                self.screen = Screen::AwaitingApproval;
+                self.status =
+                    Status::info("Registered. Waiting for an admin to approve this device…");
+                vec![Command::Verify { delay_ms: 0 }]
+            }
+            Message::EnrollFailed(err) => {
+                self.busy = false;
+                self.screen = Screen::Enroll;
+                self.status = Status::error(err);
+                vec![]
+            }
+
+            Message::Verified => {
+                self.verified = true;
+                self.busy = false;
+                self.screen = Screen::Ready;
+                self.status =
+                    Status::success("Session established — device approved and connected.");
+                vec![]
+            }
+            Message::VerifyUnauthorized => match self.screen {
+                Screen::AwaitingApproval => {
+                    self.status = Status::info("Still waiting for admin approval…");
+                    vec![Command::Verify {
+                        delay_ms: POLL_INTERVAL_MS,
+                    }]
+                }
+                Screen::Connecting => {
+                    self.screen = Screen::ReSignPrompt;
+                    self.status =
+                        Status::warning("Not authorized — not approved yet, or your IP changed.");
+                    vec![]
+                }
+                _ => vec![],
+            },
+            Message::VerifyFailed(err) => {
+                self.status = Status::error(format!("Verify failed: {err}"));
+                if self.screen == Screen::AwaitingApproval {
+                    vec![Command::Verify {
+                        delay_ms: POLL_INTERVAL_MS,
+                    }]
+                } else {
+                    vec![]
+                }
+            }
+
+            Message::ReSigned => {
+                self.busy = false;
+                self.screen = Screen::AwaitingApproval;
+                self.status = Status::info("Re-signed. An admin must re-approve this device…");
+                vec![Command::Verify { delay_ms: 0 }]
+            }
+            Message::ReSignFailed(err) => {
+                self.busy = false;
+                self.status = Status::error(format!("Re-sign failed: {err}"));
+                vec![]
+            }
+        }
+    }
+
+    /// Route a key press to the active screen's handler.
+    fn on_key(&mut self, key: KeyEvent) -> Vec<Command> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.running = false;
+            return vec![];
+        }
+        match self.screen {
+            Screen::Unlock => self.on_key_unlock(key),
+            Screen::Enroll => self.on_key_enroll(key),
+            Screen::ReSignPrompt => self.on_key_resign(key),
+            Screen::Connecting | Screen::AwaitingApproval | Screen::Ready => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.running = false;
+                }
+                vec![]
+            }
+        }
+    }
+
+    fn on_key_unlock(&mut self, key: KeyEvent) -> Vec<Command> {
+        if self.busy {
+            return vec![];
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.running = false;
+                vec![]
+            }
+            KeyCode::Enter => {
+                if self.input.is_empty() {
+                    self.status = Status::warning("Enter your passphrase.");
+                    return vec![];
+                }
+                let passphrase = std::mem::take(&mut self.input);
+                self.busy = true;
+                self.status = Status::info("Unlocking…");
+                vec![Command::Unlock { passphrase }]
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+                vec![]
+            }
+            KeyCode::Char(c) => {
+                self.input.push(c);
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    fn on_key_enroll(&mut self, key: KeyEvent) -> Vec<Command> {
+        if self.busy {
+            return vec![];
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.running = false;
+                vec![]
+            }
+            KeyCode::Tab | KeyCode::Up | KeyCode::Down => {
+                self.enroll_field = match self.enroll_field {
+                    EnrollField::Passphrase => EnrollField::Confirm,
+                    EnrollField::Confirm => EnrollField::Passphrase,
+                };
+                vec![]
+            }
+            KeyCode::Enter => self.submit_enroll(),
+            KeyCode::Backspace => {
+                self.focused_field_mut().pop();
+                vec![]
+            }
+            KeyCode::Char(c) => {
+                self.focused_field_mut().push(c);
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Validate the enroll form and, if it's sound, emit the enroll command.
+    fn submit_enroll(&mut self) -> Vec<Command> {
+        if self.input.is_empty() || self.confirm.is_empty() {
+            self.status = Status::warning("Fill in both passphrase fields.");
+            return vec![];
+        }
+        if self.input != self.confirm {
+            self.status = Status::error("Passphrases don't match.");
+            self.confirm.zeroize();
+            self.enroll_field = EnrollField::Confirm;
+            return vec![];
+        }
+        if self.input.chars().count() < MIN_PASSPHRASE_LEN {
+            self.status = Status::warning(format!("Use at least {MIN_PASSPHRASE_LEN} characters."));
+            return vec![];
+        }
+        let passphrase = std::mem::take(&mut self.input);
+        self.confirm.zeroize();
+        self.busy = true;
+        self.status = Status::info("Generating keys and registering…");
+        vec![Command::Enroll { passphrase }]
+    }
+
+    fn on_key_resign(&mut self, key: KeyEvent) -> Vec<Command> {
+        match key.code {
+            KeyCode::Char('r') => {
+                self.busy = true;
+                self.status = Status::info("Re-signing…");
+                vec![Command::ReSign]
+            }
+            KeyCode::Char('w') => {
+                self.screen = Screen::AwaitingApproval;
+                self.status = Status::info("Waiting for admin approval…");
+                vec![Command::Verify { delay_ms: 0 }]
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.running = false;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    fn focused_field_mut(&mut self) -> &mut String {
+        match self.enroll_field {
+            EnrollField::Passphrase => &mut self.input,
+            EnrollField::Confirm => &mut self.confirm,
+        }
+    }
+
+    /// Spawn the async/blocking task for a command; it reports back via `tx`.
+    fn dispatch(&mut self, cmd: Command) {
+        let tx = self.tx.clone();
+        let client = self.api.clone();
+        match cmd {
+            Command::Unlock { passphrase } => {
+                let store = self.store.clone();
+                self.runtime.spawn_blocking(move || {
+                    let mut passphrase = passphrase;
+                    let result = store.load(&passphrase);
+                    passphrase.zeroize();
+                    let msg = match result {
+                        Ok(state) => Message::Unlocked(Box::new(state)),
+                        Err(StoreError::WrongPassphrase) => Message::UnlockFailed(
+                            "Wrong passphrase, or the store file is corrupt.".into(),
+                        ),
+                        Err(e) => Message::UnlockFailed(e.to_string()),
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
+            Command::Enroll { passphrase } => {
+                let store = self.store.clone();
+                self.runtime.spawn(async move {
+                    let mut passphrase = passphrase;
+                    let outcome = enroll(&client, &store, &passphrase).await;
+                    passphrase.zeroize();
+                    let msg = match outcome {
+                        Ok(state) => Message::Enrolled(Box::new(state)),
+                        Err(e) => Message::EnrollFailed(e),
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
+            Command::Verify { delay_ms } => {
+                let token = match &self.identity {
+                    Some(state) => state.device_token.clone(),
+                    None => return,
+                };
+                self.runtime.spawn(async move {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    let msg = match auth::verify(&client, &token).await {
+                        Ok(()) => Message::Verified,
+                        Err(ApiError::Unauthorized) => Message::VerifyUnauthorized,
+                        Err(e) => Message::VerifyFailed(e.to_string()),
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
+            Command::ReSign => {
+                let (token, ehlo, private, server) = match &self.identity {
+                    Some(state) => (
+                        state.device_token.clone(),
+                        state.ehlo_secret.clone(),
+                        state.client_private,
+                        state.server_public,
+                    ),
+                    None => return,
+                };
+                self.runtime.spawn(async move {
+                    let shared = crypto::derive_shared_key(&private, &server);
+                    let token_hex = hex::encode(token.as_bytes());
+                    let ehlo_sealed = crypto::seal_hex(ehlo.as_bytes(), &shared);
+                    let msg = match auth::re_sign(&client, &token_hex, &ehlo_sealed).await {
+                        Ok(()) => Message::ReSigned,
+                        Err(e) => Message::ReSignFailed(e.to_string()),
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
+        }
+    }
+}
+
+/// Full enrollment: keygen → `/greet` → derive key → seal + `/register` → persist.
+///
+/// Returns the established (but unconfirmed) identity, or a display-ready error.
+async fn enroll(client: &ApiClient, store: &Store, passphrase: &str) -> Result<StoreState, String> {
+    let keypair = crypto::generate_keypair();
+    let server_public = auth::greet(client, &keypair.public)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let shared = crypto::derive_shared_key(&keypair.private, &server_public);
+    let device_token = crypto::random_token();
+    let ehlo_secret = crypto::random_token();
+    let sealed_token = crypto::seal_hex(device_token.as_bytes(), &shared);
+    let sealed_ehlo = crypto::seal_hex(ehlo_secret.as_bytes(), &shared);
+
+    auth::register(client, &sealed_token, &sealed_ehlo)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let state = StoreState {
+        client_private: keypair.private,
+        client_public: keypair.public,
+        server_public,
+        device_token,
+        ehlo_secret,
+    };
+
+    // Argon2id + write is CPU/IO-bound — keep it off the async worker.
+    let store = store.clone();
+    let to_save = state.clone();
+    let passphrase = passphrase.to_string();
+    tokio::task::spawn_blocking(move || store.save(&to_save, &passphrase))
+        .await
+        .map_err(|e| format!("save task failed: {e}"))?
+        .map_err(|e| e.to_string())?;
+
+    Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::crossterm::event::KeyModifiers;
+    use std::path::Path;
+
+    fn config_in(dir: &Path) -> Config {
+        Config {
+            api_base_url: "http://localhost:53971".into(),
+            request_timeout_secs: 30,
+            verify_tls: true,
+            data_dir: dir.to_string_lossy().into_owned(),
+            clipboard_clear_secs: 30,
+        }
+    }
+
+    fn app_in(dir: &Path) -> App {
+        App::new(config_in(dir)).unwrap()
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle(Message::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn starts_on_enroll_without_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(app_in(dir.path()).screen, Screen::Enroll);
+    }
+
+    #[test]
+    fn starts_on_unlock_when_a_store_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(&config_in(dir.path()));
+        std::fs::write(store.path(), b"PWMS-pretend-store").unwrap();
+        assert_eq!(app_in(dir.path()).screen, Screen::Unlock);
+    }
+
+    #[test]
+    fn unlock_enter_emits_unlock_command_with_typed_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(&config_in(dir.path()));
+        std::fs::write(store.path(), b"x").unwrap();
+        let mut app = app_in(dir.path());
+
+        type_str(&mut app, "hunter2");
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(
+            matches!(cmds.as_slice(), [Command::Unlock { passphrase }] if passphrase == "hunter2")
+        );
+        assert!(app.input.is_empty(), "input is cleared on submit");
+        assert!(app.busy);
+    }
+
+    #[test]
+    fn enroll_rejects_mismatched_passphrases() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+
+        type_str(&mut app, "longenough1");
+        press(&mut app, KeyCode::Tab);
+        type_str(&mut app, "different22");
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(cmds.is_empty());
+        assert_eq!(app.status.kind, StatusKind::Error);
+        assert!(app.confirm.is_empty(), "confirm is wiped on mismatch");
+    }
+
+    #[test]
+    fn enroll_rejects_short_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+
+        type_str(&mut app, "short"); // < MIN_PASSPHRASE_LEN
+        press(&mut app, KeyCode::Tab);
+        type_str(&mut app, "short");
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(cmds.is_empty());
+        assert_eq!(app.status.kind, StatusKind::Warning);
+    }
+
+    #[test]
+    fn enroll_matching_passphrase_emits_enroll_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+
+        type_str(&mut app, "correct horse");
+        press(&mut app, KeyCode::Tab);
+        type_str(&mut app, "correct horse");
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(
+            matches!(cmds.as_slice(), [Command::Enroll { passphrase }] if passphrase == "correct horse")
+        );
+        assert!(app.busy);
+    }
+
+    #[test]
+    fn verified_message_moves_to_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let cmds = app.update(Message::Verified);
+        assert_eq!(app.screen, Screen::Ready);
+        assert!(app.verified);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn unauthorized_while_awaiting_re_polls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::AwaitingApproval;
+        let cmds = app.update(Message::VerifyUnauthorized);
+        assert!(matches!(cmds.as_slice(), [Command::Verify { delay_ms }] if *delay_ms > 0));
+        assert_eq!(app.screen, Screen::AwaitingApproval);
+    }
+
+    #[test]
+    fn unauthorized_after_unlock_offers_resign() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::Connecting;
+        let cmds = app.update(Message::VerifyUnauthorized);
+        assert!(cmds.is_empty());
+        assert_eq!(app.screen, Screen::ReSignPrompt);
+    }
+
+    #[test]
+    fn resign_prompt_r_emits_resign_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::ReSignPrompt;
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(cmds.as_slice(), [Command::ReSign]));
+        assert!(app.busy);
+    }
+
+    #[test]
+    fn resign_success_returns_to_awaiting_and_polls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::ReSignPrompt;
+        let cmds = app.update(Message::ReSigned);
+        assert_eq!(app.screen, Screen::AwaitingApproval);
+        assert!(matches!(cmds.as_slice(), [Command::Verify { .. }]));
     }
 }
