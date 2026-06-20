@@ -4,9 +4,6 @@ use std::str::FromStr;
 /// Runtime configuration, sourced from the environment (`.env`) with sane defaults.
 ///
 /// Precedence for v1 is env > defaults; CLI/file layers come later (see plan §7).
-// Some fields are consumed in later milestones (HTTP client, clipboard); keep them
-// loaded now so the config surface is stable.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Backend API base URL, no trailing slash.
