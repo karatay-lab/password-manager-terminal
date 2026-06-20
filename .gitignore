@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Environment / secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Local reference docs (kept out of version control by request)
+/docs/
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
