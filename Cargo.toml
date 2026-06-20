@@ -1,0 +1,11 @@
+[package]
+name = "pwd-manager-terminal"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal password manager — a ratatui TUI client"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.30"          # TUI framework (re-exports crossterm)
+color-eyre = "0.6"        # error reporting + panic hook (restores terminal)
+dotenvy = "0.15"          # load .env at startup
