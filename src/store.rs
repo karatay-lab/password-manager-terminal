@@ -92,6 +92,7 @@ pub enum StoreError {
 }
 
 /// Handle to the local store at a resolved path.
+#[derive(Clone)]
 pub struct Store {
     path: PathBuf,
 }

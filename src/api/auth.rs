@@ -8,7 +8,7 @@
 
 use super::client::{check_status, ApiClient, DEVICE_TOKEN_HEADER};
 use super::error::ApiError;
-use super::models::{GreetRequest, GreetResponse, RegisterRequest};
+use super::models::{GreetRequest, GreetResponse, ReSignRequest, RegisterRequest};
 
 /// `POST /greet` — send our X25519 public key, return the server's public key.
 ///
@@ -60,6 +60,31 @@ pub async fn verify(client: &ApiClient, device_token: &str) -> Result<(), ApiErr
         .http()
         .get(client.url("/verify"))
         .header(DEVICE_TOKEN_HEADER, device_token)
+        .send()
+        .await?;
+    check_status(resp).await?;
+    Ok(())
+}
+
+/// `POST /re-sign` — re-bind this identity to the caller's current source IP.
+///
+/// Use as the fallback when [`verify`] returns 401 because the IP changed.
+/// `token_hex` is `hex(device_token_bytes)` (plain, **not** sealed); `sealed_ehlo_hex`
+/// is `hex(seal(ehlo))`. On success the server resets `is_confirmed=false`, so an
+/// admin must re-approve before [`verify`] passes again.
+pub async fn re_sign(
+    client: &ApiClient,
+    token_hex: &str,
+    sealed_ehlo_hex: &str,
+) -> Result<(), ApiError> {
+    let body = ReSignRequest {
+        token: token_hex.to_string(),
+        ehlo: sealed_ehlo_hex.to_string(),
+    };
+    let resp = client
+        .http()
+        .post(client.url("/re-sign"))
+        .json(&body)
         .send()
         .await?;
     check_status(resp).await?;

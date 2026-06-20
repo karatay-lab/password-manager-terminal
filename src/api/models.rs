@@ -33,6 +33,19 @@ pub struct RegisterRequest {
     pub ehlo: String,
 }
 
+/// `POST /re-sign` request — re-bind an existing identity to the caller's IP.
+///
+/// ⚠️ Unlike [`RegisterRequest`], `token` here is the **plain** hex of the raw
+/// token bytes (NOT sealed); only `ehlo` is sealed. See `docs/protocol-notes.md`
+/// (api.md is wrong on this). The server resets `is_confirmed=false` afterwards.
+#[derive(Debug, Serialize)]
+pub struct ReSignRequest {
+    /// `hex(device_token_bytes)` — plain, not sealed.
+    pub token: String,
+    /// Sealed ehlo secret, hex.
+    pub ehlo: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,5 +74,15 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, serde_json::json!({ "token": "aa", "ehlo": "bb" }));
+    }
+
+    #[test]
+    fn resign_request_has_token_and_ehlo() {
+        let json = serde_json::to_value(ReSignRequest {
+            token: "cc".into(),
+            ehlo: "dd".into(),
+        })
+        .unwrap();
+        assert_eq!(json, serde_json::json!({ "token": "cc", "ehlo": "dd" }));
     }
 }
