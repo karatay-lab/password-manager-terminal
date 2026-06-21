@@ -207,7 +207,18 @@ to go back/quit, single-letter actions (`n` new, `e` edit, `c` copy, `r` re-sign
     detail** (decrypted fields; `s` reveal/hide password), **Groups** (read-only
     list). 401 on a vault read maps to an actionable hint. **Deferred:** list
     pagination, and copy-to-clipboard (→ M6). End-to-end vs a live backend pending.
-- **M5 — write:** create + update + group create (renew = create-new, see §8).
+- **M5 — write:** create entry + create group (renew = create-new, see §8).
+  - ✅ `api::vault::{create_group, create_password}` + request DTOs (`GroupCreateRequest`,
+    `PwdCreateRequest`; `None` fields omitted so the server applies defaults).
+    `crypto::generate_password` (rejection-sampled, no modulo bias). Screens: **New
+    entry** (name/group-picker/username/password/url/notes/valid-days; `Ctrl+G`
+    generates; password reveals only while focused; zeroized on drop) and **New
+    group** (name/extra). `n` opens the form on Entries/Groups; **`e` on detail =
+    pre-filled renew → fresh `POST /pwd/create`** (the old row persists). Validation:
+    non-empty password, `valid_since_days` 1–365 (def 30), name ≤256, group ≤128.
+  - ⚠️ **No update/delete endpoint exists** (verified table is create-only) — "edit"
+    is always a new create. **Deferred:** copy-to-clipboard, search (→ M6).
+    End-to-end vs a live backend still pending.
 - **M6 — secure copy & polish:** clipboard auto-clear, zeroize audit, search, help,
   error hints, usage docs.
 
@@ -219,15 +230,18 @@ to go back/quit, single-letter actions (`n` new, `e` edit, `c` copy, `r` re-sign
 - [x] ~~keymap style~~ — **DECIDED (M3): arrow/letter style** (§8).
 - [x] ~~`pwd` JSON schema fields~~ — **DECIDED (M4): `{username,password,url,notes}`**
   (`crate::secret::PwdSecret`); `name`/`extra` stay server-plaintext, no secrets there.
-- [ ] v1 scope cuts (§2)
+- [x] ~~password generator in v1?~~ — **DECIDED (M5): yes**, in the new-entry form (`Ctrl+G`).
+- [ ] v1 scope cuts (§2) — remaining open: token `/refresh` UI, search (→ M6).
 - [ ] idle auto-lock in v1? (§6)
 
 ---
 
 ### Next step
 
-M0–M4 landed (scaffold, crypto core, enrollment, session loop, and read-side vault:
-entries list valid/expired, decrypted detail view, groups list). **M5 — write:**
-`POST /pwd/create`, `POST /pwd/create` for renew (update doesn't reset expiry — renew =
-create-new, §8), and `POST /group/create`. Build the entry-edit form (seal `pwd` via
-`PwdSecret::seal`) and group-create, wired into the entries/groups screens.
+M0–M5 landed (scaffold, crypto core, enrollment, session loop, read-side vault, and
+write-side: new-entry/new-group forms, password generator, renew-as-new-create).
+**M6 — secure copy & polish:** clipboard copy of username/password with auto-clear
+(`Config::clipboard_clear_secs` already exists), entry search/filter on the list,
+a help overlay, a final zeroize audit, and usage docs. Decide there: clipboard
+backend (e.g. `arboard`) and whether to ship idle auto-lock (§6) / token `/refresh`
+UI in v1.

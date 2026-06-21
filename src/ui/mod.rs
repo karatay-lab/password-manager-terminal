@@ -9,7 +9,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, EnrollField, Screen, StatusKind};
+use crate::app::{App, EnrollField, EntryField, GroupField, Screen, StatusKind};
 use components::{centered, mask, truncate};
 
 /// Draw the whole UI for the current frame.
@@ -38,6 +38,8 @@ pub fn view(app: &App, frame: &mut Frame) {
         Screen::Entries => render_entries(app, frame, body),
         Screen::Groups => render_groups(app, frame, body),
         Screen::EntryDetail => render_detail(app, frame, body),
+        Screen::NewEntry => render_new_entry(app, frame, body),
+        Screen::NewGroup => render_new_group(app, frame, body),
     }
 
     render_status(app, frame, status);
@@ -159,8 +161,10 @@ fn render_entries(app: &App, frame: &mut Frame, area: Rect) {
     }
 
     frame.render_widget(
-        Line::from("↑/↓ move · Enter open · t valid/expired · g groups · r refresh · Esc quit")
-            .dim(),
+        Line::from(
+            "↑/↓ move · Enter open · n new · t valid/expired · g groups · r refresh · Esc quit",
+        )
+        .dim(),
         hint_area,
     );
 }
@@ -191,7 +195,7 @@ fn render_groups(app: &App, frame: &mut Frame, area: Rect) {
         frame.render_widget(List::new(items).block(block), list_area);
     }
 
-    frame.render_widget(Line::from("Esc back · q quit").dim(), hint_area);
+    frame.render_widget(Line::from("n new · Esc back · q quit").dim(), hint_area);
 }
 
 fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
@@ -231,13 +235,94 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
         field("Created", &detail.created_at),
         Line::raw(""),
         Line::from(if app.reveal {
-            "s hide password · Esc back · q quit"
+            "s hide · e renew · Esc back · q quit"
         } else {
-            "s reveal password · Esc back · q quit"
+            "s reveal · e renew · Esc back · q quit"
         })
         .dim(),
     ];
     render_card(frame, area, "Entry", lines, 16);
+}
+
+fn render_new_entry(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(form) = &app.entry_form else {
+        render_card(frame, area, "New entry", vec![Line::raw("No form.")], 5);
+        return;
+    };
+    let group_label = match app.groups.get(form.group_idx) {
+        Some(g) => format!(
+            "‹ {} ›  ({}/{})",
+            g.name,
+            form.group_idx + 1,
+            app.groups.len()
+        ),
+        None => "‹ none ›".to_string(),
+    };
+    // The password reveals only while its own field is focused (authoring feedback).
+    let password = if form.field == EntryField::Password {
+        form.password.clone()
+    } else {
+        mask(&form.password)
+    };
+
+    let row = |label: &str, value: String, field: EntryField| {
+        let focused = form.field == field;
+        let marker = if focused { "› " } else { "  " };
+        let cursor = if focused { "_" } else { "" };
+        let line = Line::from(format!("{marker}{label:<11}{value}{cursor}"));
+        if focused {
+            line.fg(Color::Cyan)
+        } else {
+            line
+        }
+    };
+
+    let title = if form.renewing {
+        "Renew entry"
+    } else {
+        "New entry"
+    };
+    let lines = vec![
+        row("Name", form.name.clone(), EntryField::Name),
+        row("Group", group_label, EntryField::Group),
+        Line::raw(""),
+        row("Username", form.username.clone(), EntryField::Username),
+        row("Password", password, EntryField::Password),
+        row("URL", form.url.clone(), EntryField::Url),
+        row("Notes", form.notes.clone(), EntryField::Notes),
+        row("Valid days", form.valid_days.clone(), EntryField::ValidDays),
+        Line::raw(""),
+        Line::raw("Tab/↑↓ move · ←→ pick group · Ctrl+G generate · Enter save · Esc cancel").dim(),
+    ];
+    render_card(frame, area, title, lines, 16);
+}
+
+fn render_new_group(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(form) = &app.group_form else {
+        render_card(frame, area, "New group", vec![Line::raw("No form.")], 5);
+        return;
+    };
+    let row = |label: &str, value: &str, field: GroupField| {
+        let focused = form.field == field;
+        let marker = if focused { "› " } else { "  " };
+        let cursor = if focused { "_" } else { "" };
+        let line = Line::from(format!("{marker}{label:<7}{value}{cursor}"));
+        if focused {
+            line.fg(Color::Cyan)
+        } else {
+            line
+        }
+    };
+    let lines = vec![
+        Line::raw("Create a group to organize entries. Both fields are stored in plaintext"),
+        Line::raw("on the server — don't put secrets here."),
+        Line::raw(""),
+        row("Name", &form.name, GroupField::Name),
+        row("Extra", &form.extra, GroupField::Extra),
+        Line::raw(""),
+        Line::raw("Tab/↑↓ move · Enter save · Esc cancel").dim(),
+    ];
+    render_card(frame, area, "New group", lines, 12);
 }
 
 fn render_status(app: &App, frame: &mut Frame, area: Rect) {

@@ -21,6 +21,10 @@ const X25519_BASEPOINT: [u8; 32] = [
 /// Length of the AES-GCM nonce we prepend to every ciphertext.
 const NONCE_LEN: usize = 12;
 
+/// Character set for generated passwords: A–Z, a–z, 0–9, and common symbols.
+const PASSWORD_CHARSET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{}";
+
 /// Errors from sealing/opening or key handling.
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum CryptoError {
@@ -62,6 +66,26 @@ pub fn random_token() -> String {
     let mut bytes = [0u8; 16];
     OsRng.fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+/// Generate a random password of `len` characters drawn uniformly from
+/// [`PASSWORD_CHARSET`] using the OS CSPRNG.
+///
+/// Rejection sampling keeps every character equally likely (no modulo bias):
+/// bytes at or above the largest multiple of the charset length are discarded.
+pub fn generate_password(len: usize) -> String {
+    let n = PASSWORD_CHARSET.len();
+    let limit = (256 / n) * n; // charset is < 256, so this fits in a byte's range
+    let mut password = String::with_capacity(len);
+    let mut byte = [0u8; 1];
+    while password.len() < len {
+        OsRng.fill_bytes(&mut byte);
+        let b = byte[0] as usize;
+        if b < limit {
+            password.push(PASSWORD_CHARSET[b % n] as char);
+        }
+    }
+    password
 }
 
 /// Derive the shared secret via ECDH: `x25519(my_private, peer_public)`.
@@ -210,6 +234,18 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn generated_password_has_requested_length_and_charset() {
+        let p = generate_password(24);
+        assert_eq!(p.chars().count(), 24);
+        assert!(p.bytes().all(|b| PASSWORD_CHARSET.contains(&b)));
+    }
+
+    #[test]
+    fn generated_passwords_are_unique() {
+        assert_ne!(generate_password(24), generate_password(24));
     }
 
     #[test]

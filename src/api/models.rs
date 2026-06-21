@@ -47,7 +47,33 @@ pub struct ReSignRequest {
     pub ehlo: String,
 }
 
-/// `GET /group/list` item (plaintext).
+/// `POST /group/create` request. `name` ≤128 chars (server-enforced); `extra` is
+/// optional plaintext metadata.
+#[derive(Debug, Serialize)]
+pub struct GroupCreateRequest {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<String>,
+}
+
+/// `POST /pwd/create` request. `pwd` is sealed hex; `name`/`extra` are **plaintext**
+/// server-side (never secrets). `valid_since_days` (1–365, default 30 server-side)
+/// sets the expiry window. There is no update endpoint, so a "renew" is just a fresh
+/// create (see `docs/protocol-notes.md`); `None` fields are omitted so the server
+/// applies its defaults.
+#[derive(Debug, Serialize)]
+pub struct PwdCreateRequest {
+    pub pwd: String,
+    pub group_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_since_days: Option<i64>,
+}
+
+/// `GET /group/list` item, and the `POST /group/create` response (plaintext).
 #[derive(Debug, Deserialize)]
 pub struct GroupSummary {
     pub uuid: String,
@@ -137,6 +163,32 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, serde_json::json!({ "token": "cc", "ehlo": "dd" }));
+    }
+
+    #[test]
+    fn group_create_request_omits_none_extra() {
+        let json = serde_json::to_value(GroupCreateRequest {
+            name: "Work".into(),
+            extra: None,
+        })
+        .unwrap();
+        assert_eq!(json, serde_json::json!({ "name": "Work" }));
+    }
+
+    #[test]
+    fn pwd_create_request_omits_none_fields() {
+        let json = serde_json::to_value(PwdCreateRequest {
+            pwd: "deadbeef".into(),
+            group_id: "g1".into(),
+            name: None,
+            extra: None,
+            valid_since_days: Some(30),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "pwd": "deadbeef", "group_id": "g1", "valid_since_days": 30 })
+        );
     }
 
     #[test]
