@@ -200,6 +200,13 @@ to go back/quit, single-letter actions (`n` new, `e` edit, `c` copy, `r` re-sign
     `auth::re_sign` + `ReSignRequest` landed. **Pending:** end-to-end run against a
     live backend (no backend available in dev here) — logic is unit-tested only.
 - **M4 — read:** groups list, pwd list (valid/expired), get + decrypt + detail view.
+  - ✅ `api::vault` (`list_groups`, `list_passwords{valid,expired}`, `get_password`)
+    + DTOs (`GroupSummary`, `PwdListItem`, `PwdDetail`). `crate::secret::PwdSecret`
+    (`{username,password,url,notes}`, zeroize-on-drop) seals/opens the `pwd` blob.
+    Screens: **Entries** (valid/expired toggle, ↑/↓ + Enter, refresh), **Entry
+    detail** (decrypted fields; `s` reveal/hide password), **Groups** (read-only
+    list). 401 on a vault read maps to an actionable hint. **Deferred:** list
+    pagination, and copy-to-clipboard (→ M6). End-to-end vs a live backend pending.
 - **M5 — write:** create + update + group create (renew = create-new, see §8).
 - **M6 — secure copy & polish:** clipboard auto-clear, zeroize audit, search, help,
   error hints, usage docs.
@@ -210,16 +217,17 @@ to go back/quit, single-letter actions (`n` new, `e` edit, `c` copy, `r` re-sign
 - [x] ~~async (tokio) vs threads~~ — **DECIDED (M2): tokio + reqwest** (§5).
 - [x] ~~local store: keyring vs passphrase vs both~~ — **DECIDED (M2): passphrase + Argon2id** (§6).
 - [x] ~~keymap style~~ — **DECIDED (M3): arrow/letter style** (§8).
+- [x] ~~`pwd` JSON schema fields~~ — **DECIDED (M4): `{username,password,url,notes}`**
+  (`crate::secret::PwdSecret`); `name`/`extra` stay server-plaintext, no secrets there.
 - [ ] v1 scope cuts (§2)
 - [ ] idle auto-lock in v1? (§6)
-- [ ] `pwd` JSON schema fields — confirm `{username,password,url,notes}` is what we want.
 
 ---
 
 ### Next step
 
-M0–M3 landed (scaffold, crypto core, enrollment api + encrypted store, and the live
-session loop: enroll/approval/unlock/re-sign screens on a tokio bridge). **M4 — read:**
-groups list, password list (valid/expired), and `GET /pwd/get/{uuid}` → decrypt → a
-detail view. First decision there: confirm the `pwd` JSON schema `{username,password,
-url,notes}` (§11) before building the seal/open of real entries.
+M0–M4 landed (scaffold, crypto core, enrollment, session loop, and read-side vault:
+entries list valid/expired, decrypted detail view, groups list). **M5 — write:**
+`POST /pwd/create`, `POST /pwd/create` for renew (update doesn't reset expiry — renew =
+create-new, §8), and `POST /group/create`. Build the entry-edit form (seal `pwd` via
+`PwdSecret::seal`) and group-create, wired into the entries/groups screens.

@@ -21,10 +21,12 @@ use ratatui::DefaultTerminal;
 use tokio::runtime::Runtime;
 use zeroize::Zeroize;
 
-use crate::api::{auth, ApiClient, ApiError};
+use crate::api::models::{PwdDetail, PwdListItem};
+use crate::api::{auth, vault, ApiClient, ApiError};
 use crate::config::Config;
 use crate::crypto;
 use crate::message::{Command, Message};
+use crate::secret::PwdSecret;
 use crate::store::{Store, StoreError, StoreState};
 use crate::ui;
 
@@ -49,8 +51,12 @@ pub enum Screen {
     AwaitingApproval,
     /// `/verify` returned 401 after unlock — offer re-sign or keep waiting.
     ReSignPrompt,
-    /// Approved and connected. (Vault browsing lands in M4.)
-    Ready,
+    /// The vault: a scrollable list of entries (valid or expired).
+    Entries,
+    /// One decrypted entry's fields.
+    EntryDetail,
+    /// The list of groups (read-only in v1's M4).
+    Groups,
 }
 
 /// Which field the enroll form's cursor is on.
@@ -58,6 +64,67 @@ pub enum Screen {
 pub enum EnrollField {
     Passphrase,
     Confirm,
+}
+
+/// A decrypted row shown in the entries list. Carries only the label fields
+/// (username/url) — the password from the list blob is dropped after decoding.
+pub struct EntryRow {
+    pub uuid: String,
+    pub username: String,
+    pub url: String,
+    /// Days until expiry (from the list endpoint); `0` on the expired list.
+    pub expires: i64,
+}
+
+/// A group as shown in the groups list.
+pub struct GroupRow {
+    pub name: String,
+    pub extra: Option<String>,
+}
+
+/// A fully decrypted entry for the detail screen. `secret` zeroizes on drop.
+pub struct DetailView {
+    pub name: Option<String>,
+    pub group: Option<String>,
+    pub expires: i64,
+    pub valid_since_days: i64,
+    pub created_at: String,
+    pub secret: PwdSecret,
+}
+
+impl DetailView {
+    fn from_response(resp: PwdDetail, secret: PwdSecret) -> Self {
+        Self {
+            name: resp.name,
+            group: resp.group.map(|g| g.name),
+            expires: resp.expires,
+            valid_since_days: resp.valid_since_days,
+            created_at: resp.created_at,
+            secret,
+        }
+    }
+}
+
+/// Decrypt a list row into its display label, falling back to a placeholder if the
+/// blob can't be opened (so one bad entry doesn't sink the whole list).
+fn row_from_item(item: PwdListItem, key: &[u8; 32]) -> EntryRow {
+    let (username, url) = match PwdSecret::open(&item.pwd, key) {
+        Ok(secret) => {
+            let username = if secret.username.is_empty() {
+                "(no username)".to_string()
+            } else {
+                secret.username.clone()
+            };
+            (username, secret.url.clone())
+        }
+        Err(_) => ("(unreadable — wrong key?)".to_string(), String::new()),
+    };
+    EntryRow {
+        uuid: item.uuid,
+        username,
+        url,
+        expires: item.expires,
+    }
 }
 
 /// Severity of the status-line message, used only for colour.
@@ -121,6 +188,18 @@ pub struct App {
     /// `/verify` has passed at least once this session.
     pub verified: bool,
 
+    /// Entries currently listed, and which list (valid vs expired) they came from.
+    pub entries: Vec<EntryRow>,
+    pub show_expired: bool,
+    /// Cursor position within [`App::entries`].
+    pub selected: usize,
+    /// Groups, populated when the groups screen is opened.
+    pub groups: Vec<GroupRow>,
+    /// The entry shown on the detail screen, if any.
+    pub detail: Option<DetailView>,
+    /// Whether the detail screen reveals the password in clear text.
+    pub reveal: bool,
+
     /// The unlocked/enrolled identity. Secret — never rendered.
     identity: Option<StoreState>,
     api: ApiClient,
@@ -165,6 +244,12 @@ impl App {
             status,
             busy: false,
             verified: false,
+            entries: Vec::new(),
+            show_expired: false,
+            selected: 0,
+            groups: Vec::new(),
+            detail: None,
+            reveal: false,
             identity: None,
             api,
             store,
@@ -244,10 +329,9 @@ impl App {
             Message::Verified => {
                 self.verified = true;
                 self.busy = false;
-                self.screen = Screen::Ready;
-                self.status =
-                    Status::success("Session established — device approved and connected.");
-                vec![]
+                self.screen = Screen::Entries;
+                self.status = Status::info("Session established — loading entries…");
+                vec![Command::LoadPasswords { expired: false }]
             }
             Message::VerifyUnauthorized => match self.screen {
                 Screen::AwaitingApproval => {
@@ -286,6 +370,40 @@ impl App {
                 self.status = Status::error(format!("Re-sign failed: {err}"));
                 vec![]
             }
+
+            Message::PasswordsLoaded { expired, rows } => {
+                self.show_expired = expired;
+                self.entries = rows;
+                self.selected = 0;
+                self.screen = Screen::Entries;
+                let n = self.entries.len();
+                let kind = if expired { "expired" } else { "valid" };
+                self.status = Status::success(format!(
+                    "{n} {kind} {}",
+                    if n == 1 { "entry" } else { "entries" }
+                ));
+                vec![]
+            }
+            Message::GroupsLoaded(rows) => {
+                self.groups = rows;
+                self.screen = Screen::Groups;
+                let n = self.groups.len();
+                self.status =
+                    Status::info(format!("{n} {}", if n == 1 { "group" } else { "groups" }));
+                vec![]
+            }
+            Message::EntryLoaded(detail) => {
+                self.detail = Some(*detail);
+                self.reveal = false;
+                self.screen = Screen::EntryDetail;
+                self.status = Status::info("Entry decrypted. Press s to reveal the password.");
+                vec![]
+            }
+            Message::VaultFailed(err) => {
+                self.busy = false;
+                self.status = Status::error(err);
+                vec![]
+            }
         }
     }
 
@@ -299,7 +417,10 @@ impl App {
             Screen::Unlock => self.on_key_unlock(key),
             Screen::Enroll => self.on_key_enroll(key),
             Screen::ReSignPrompt => self.on_key_resign(key),
-            Screen::Connecting | Screen::AwaitingApproval | Screen::Ready => {
+            Screen::Entries => self.on_key_entries(key),
+            Screen::Groups => self.on_key_groups(key),
+            Screen::EntryDetail => self.on_key_detail(key),
+            Screen::Connecting | Screen::AwaitingApproval => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     self.running = false;
                 }
@@ -418,6 +539,82 @@ impl App {
         }
     }
 
+    fn on_key_entries(&mut self, key: KeyEvent) -> Vec<Command> {
+        match key.code {
+            KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                vec![]
+            }
+            KeyCode::Down => {
+                if self.selected + 1 < self.entries.len() {
+                    self.selected += 1;
+                }
+                vec![]
+            }
+            KeyCode::Enter => match self.entries.get(self.selected) {
+                Some(row) => {
+                    let uuid = row.uuid.clone();
+                    self.status = Status::info("Loading entry…");
+                    vec![Command::LoadEntry { uuid }]
+                }
+                None => vec![],
+            },
+            KeyCode::Char('t') => {
+                let expired = !self.show_expired;
+                self.status = Status::info("Loading…");
+                vec![Command::LoadPasswords { expired }]
+            }
+            KeyCode::Char('g') => {
+                self.status = Status::info("Loading groups…");
+                vec![Command::LoadGroups]
+            }
+            KeyCode::Char('r') => {
+                let expired = self.show_expired;
+                self.status = Status::info("Refreshing…");
+                vec![Command::LoadPasswords { expired }]
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.running = false;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    fn on_key_groups(&mut self, key: KeyEvent) -> Vec<Command> {
+        match key.code {
+            KeyCode::Esc => {
+                self.screen = Screen::Entries;
+                vec![]
+            }
+            KeyCode::Char('q') => {
+                self.running = false;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    fn on_key_detail(&mut self, key: KeyEvent) -> Vec<Command> {
+        match key.code {
+            KeyCode::Char('s') => {
+                self.reveal = !self.reveal;
+                vec![]
+            }
+            KeyCode::Esc => {
+                self.detail = None;
+                self.reveal = false;
+                self.screen = Screen::Entries;
+                vec![]
+            }
+            KeyCode::Char('q') => {
+                self.running = false;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
     /// Spawn the async/blocking task for a command; it reports back via `tx`.
     fn dispatch(&mut self, cmd: Command) {
         let tx = self.tx.clone();
@@ -490,7 +687,80 @@ impl App {
                     let _ = tx.send(msg);
                 });
             }
+            Command::LoadPasswords { expired } => {
+                let Some((token, key)) = self.session_credentials() else {
+                    return;
+                };
+                self.runtime.spawn(async move {
+                    let msg = match vault::list_passwords(&client, &token, expired).await {
+                        Ok(items) => {
+                            let rows = items
+                                .into_iter()
+                                .map(|item| row_from_item(item, &key))
+                                .collect();
+                            Message::PasswordsLoaded { expired, rows }
+                        }
+                        Err(e) => Message::VaultFailed(vault_error("load entries", &e)),
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
+            Command::LoadGroups => {
+                let Some((token, _key)) = self.session_credentials() else {
+                    return;
+                };
+                self.runtime.spawn(async move {
+                    let msg = match vault::list_groups(&client, &token).await {
+                        Ok(groups) => Message::GroupsLoaded(
+                            groups
+                                .into_iter()
+                                .map(|g| GroupRow {
+                                    name: g.name,
+                                    extra: g.extra,
+                                })
+                                .collect(),
+                        ),
+                        Err(e) => Message::VaultFailed(vault_error("load groups", &e)),
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
+            Command::LoadEntry { uuid } => {
+                let Some((token, key)) = self.session_credentials() else {
+                    return;
+                };
+                self.runtime.spawn(async move {
+                    let msg = match vault::get_password(&client, &token, &uuid).await {
+                        Ok(resp) => match PwdSecret::open(&resp.pwd, &key) {
+                            Ok(secret) => Message::EntryLoaded(Box::new(
+                                DetailView::from_response(resp, secret),
+                            )),
+                            Err(e) => Message::VaultFailed(format!("Couldn't decrypt entry: {e}")),
+                        },
+                        Err(e) => Message::VaultFailed(vault_error("load entry", &e)),
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
         }
+    }
+
+    /// The device token and shared key for the current session, if unlocked.
+    fn session_credentials(&self) -> Option<(String, [u8; 32])> {
+        self.identity
+            .as_ref()
+            .map(|state| (state.device_token.clone(), state.shared_key()))
+    }
+}
+
+/// Build a display-ready error string for a failed vault read, turning the generic
+/// 401 into the actionable hint the backend can't give us (plan §9).
+fn vault_error(action: &str, err: &ApiError) -> String {
+    match err {
+        ApiError::Unauthorized => {
+            "Authorization lost — your IP may have changed. Restart to unlock and re-sign.".into()
+        }
+        other => format!("Couldn't {action}: {other}"),
     }
 }
 
@@ -652,13 +922,137 @@ mod tests {
     }
 
     #[test]
-    fn verified_message_moves_to_ready() {
+    fn verified_message_loads_entries() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
         let cmds = app.update(Message::Verified);
-        assert_eq!(app.screen, Screen::Ready);
+        assert_eq!(app.screen, Screen::Entries);
         assert!(app.verified);
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::LoadPasswords { expired: false }]
+        ));
+    }
+
+    fn rows(specs: &[(&str, &str)]) -> Vec<EntryRow> {
+        specs
+            .iter()
+            .map(|(uuid, user)| EntryRow {
+                uuid: (*uuid).into(),
+                username: (*user).into(),
+                url: String::new(),
+                expires: 7,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn passwords_loaded_populates_and_resets_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.selected = 5;
+        let cmds = app.update(Message::PasswordsLoaded {
+            expired: true,
+            rows: rows(&[("a", "alice"), ("b", "bob")]),
+        });
         assert!(cmds.is_empty());
+        assert_eq!(app.screen, Screen::Entries);
+        assert!(app.show_expired);
+        assert_eq!(app.entries.len(), 2);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn entries_down_then_enter_loads_selected_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::Entries;
+        app.entries = rows(&[("a", "alice"), ("b", "bob")]);
+
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected, 1);
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(cmds.as_slice(), [Command::LoadEntry { uuid }] if uuid == "b"));
+    }
+
+    #[test]
+    fn entries_down_is_clamped_at_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::Entries;
+        app.entries = rows(&[("a", "alice")]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn entries_t_toggles_to_expired_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::Entries;
+        app.show_expired = false;
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('t'),
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::LoadPasswords { expired: true }]
+        ));
+    }
+
+    #[test]
+    fn entries_g_requests_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::Entries;
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(cmds.as_slice(), [Command::LoadGroups]));
+    }
+
+    #[test]
+    fn entry_detail_toggles_reveal_with_s() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::EntryDetail;
+        app.detail = Some(DetailView {
+            name: None,
+            group: None,
+            expires: 1,
+            valid_since_days: 30,
+            created_at: String::new(),
+            secret: PwdSecret::default(),
+        });
+        assert!(!app.reveal);
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.reveal);
+        press(&mut app, KeyCode::Char('s'));
+        assert!(!app.reveal);
+    }
+
+    #[test]
+    fn entry_detail_esc_returns_to_entries_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::EntryDetail;
+        app.detail = Some(DetailView {
+            name: None,
+            group: None,
+            expires: 1,
+            valid_since_days: 30,
+            created_at: String::new(),
+            secret: PwdSecret::default(),
+        });
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::Entries);
+        assert!(app.detail.is_none());
     }
 
     #[test]

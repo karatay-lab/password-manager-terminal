@@ -19,3 +19,12 @@ pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
 pub fn mask(secret: &str) -> String {
     "•".repeat(secret.chars().count())
 }
+
+/// Shorten `s` to at most `max` characters, appending `…` when truncated.
+pub fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
+}

@@ -4,13 +4,13 @@
 mod components;
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Padding, Paragraph};
+use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, EnrollField, Screen, StatusKind};
-use components::{centered, mask};
+use components::{centered, mask, truncate};
 
 /// Draw the whole UI for the current frame.
 pub fn view(app: &App, frame: &mut Frame) {
@@ -35,7 +35,9 @@ pub fn view(app: &App, frame: &mut Frame) {
         ),
         Screen::AwaitingApproval => render_awaiting(frame, body),
         Screen::ReSignPrompt => render_resign(frame, body),
-        Screen::Ready => render_ready(app, frame, body),
+        Screen::Entries => render_entries(app, frame, body),
+        Screen::Groups => render_groups(app, frame, body),
+        Screen::EntryDetail => render_detail(app, frame, body),
     }
 
     render_status(app, frame, status);
@@ -115,16 +117,127 @@ fn render_resign(frame: &mut Frame, area: Rect) {
     render_card(frame, area, "Re-sign?", lines, 13);
 }
 
-fn render_ready(app: &App, frame: &mut Frame, area: Rect) {
+fn render_entries(app: &App, frame: &mut Frame, area: Rect) {
+    let [list_area, hint_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+
+    let scope = if app.show_expired { "expired" } else { "valid" };
+    let block = Block::bordered().title(format!(" Entries ({scope}) "));
+
+    if app.entries.is_empty() {
+        let msg = Paragraph::new(vec![
+            Line::raw(""),
+            Line::from(format!("No {scope} entries.").dim()),
+        ])
+        .block(block);
+        frame.render_widget(msg, list_area);
+    } else {
+        let items: Vec<ListItem> = app
+            .entries
+            .iter()
+            .map(|e| {
+                let when = if app.show_expired {
+                    "expired".to_string()
+                } else {
+                    format!("{}d left", e.expires)
+                };
+                ListItem::new(format!(
+                    "{:<26} {:<34} {}",
+                    truncate(&e.username, 26),
+                    truncate(&e.url, 34),
+                    when
+                ))
+            })
+            .collect();
+        let list = List::new(items)
+            .block(block)
+            .highlight_symbol("› ")
+            .highlight_style(Style::new().fg(Color::Black).bg(Color::Cyan));
+        let mut state = ListState::default();
+        state.select(Some(app.selected));
+        frame.render_stateful_widget(list, list_area, &mut state);
+    }
+
+    frame.render_widget(
+        Line::from("↑/↓ move · Enter open · t valid/expired · g groups · r refresh · Esc quit")
+            .dim(),
+        hint_area,
+    );
+}
+
+fn render_groups(app: &App, frame: &mut Frame, area: Rect) {
+    let [list_area, hint_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+    let block = Block::bordered().title(" Groups ");
+
+    if app.groups.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from("No groups.".dim())).block(block),
+            list_area,
+        );
+    } else {
+        let items: Vec<ListItem> = app
+            .groups
+            .iter()
+            .map(|g| match &g.extra {
+                Some(extra) if !extra.is_empty() => ListItem::new(format!(
+                    "{:<28} {}",
+                    truncate(&g.name, 28),
+                    truncate(extra, 40)
+                )),
+                _ => ListItem::new(g.name.clone()),
+            })
+            .collect();
+        frame.render_widget(List::new(items).block(block), list_area);
+    }
+
+    frame.render_widget(Line::from("Esc back · q quit").dim(), hint_area);
+}
+
+fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
+    let Some(detail) = &app.detail else {
+        render_card(frame, area, "Entry", vec![Line::raw("No entry.")], 5);
+        return;
+    };
+    let s = &detail.secret;
+    let password = if app.reveal {
+        s.password.clone()
+    } else {
+        mask(&s.password)
+    };
+    let field = |label: &str, value: &str| {
+        Line::from(vec![
+            format!("{label:<10}").bold(),
+            value.to_string().into(),
+        ])
+    };
+    let none = "(none)".to_string();
     let lines = vec![
-        Line::from("✓ Session established".bold().fg(Color::Green)),
+        field("Name", detail.name.as_ref().unwrap_or(&none)),
+        field("Group", detail.group.as_ref().unwrap_or(&none)),
         Line::raw(""),
-        Line::from(format!("Connected to {}", app.config.api_base_url)),
-        Line::raw("This device is approved. Vault browsing arrives in M4."),
+        field("Username", &s.username),
+        field("Password", &password),
+        field("URL", &s.url),
+        field("Notes", &s.notes),
         Line::raw(""),
-        Line::raw("q/Esc quit").dim(),
+        field(
+            "Expires",
+            &format!(
+                "{} day(s) · valid window {} day(s)",
+                detail.expires, detail.valid_since_days
+            ),
+        ),
+        field("Created", &detail.created_at),
+        Line::raw(""),
+        Line::from(if app.reveal {
+            "s hide password · Esc back · q quit"
+        } else {
+            "s reveal password · Esc back · q quit"
+        })
+        .dim(),
     ];
-    render_card(frame, area, "Ready", lines, 9);
+    render_card(frame, area, "Entry", lines, 16);
 }
 
 fn render_status(app: &App, frame: &mut Frame, area: Rect) {

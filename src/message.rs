@@ -12,6 +12,7 @@
 
 use ratatui::crossterm::event::KeyEvent;
 
+use crate::app::{DetailView, EntryRow, GroupRow};
 use crate::store::StoreState;
 
 /// An input event or the outcome of a [`Command`].
@@ -40,6 +41,15 @@ pub enum Message {
     ReSigned,
     /// `/re-sign` failed.
     ReSignFailed(String),
+
+    /// Password list loaded and each row decrypted to its display label.
+    PasswordsLoaded { expired: bool, rows: Vec<EntryRow> },
+    /// Group list loaded.
+    GroupsLoaded(Vec<GroupRow>),
+    /// A single entry was fetched and decrypted.
+    EntryLoaded(Box<DetailView>),
+    /// A vault read failed (network, auth, or decryption); message is display-ready.
+    VaultFailed(String),
 }
 
 /// Async work requested by `App::update`, executed on the tokio runtime.
@@ -54,4 +64,10 @@ pub enum Command {
     Verify { delay_ms: u64 },
     /// Re-bind the current identity to this IP via `/re-sign`.
     ReSign,
+    /// Fetch + decrypt the valid or expired password list.
+    LoadPasswords { expired: bool },
+    /// Fetch the group list.
+    LoadGroups,
+    /// Fetch + decrypt a single entry by uuid.
+    LoadEntry { uuid: String },
 }

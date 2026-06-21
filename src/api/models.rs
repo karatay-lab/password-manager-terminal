@@ -1,8 +1,9 @@
-//! Request/response DTOs for the enrollment endpoints.
+//! Request/response DTOs for the enrollment + vault endpoints.
 //!
 //! Shapes are taken from `docs/protocol-notes.md` (verified against backend source).
-//! All sealed fields (`token`, `ehlo`) are hex strings of `nonce‖ct‖tag` produced
-//! by [`crate::crypto::seal_hex`]; the server sees ciphertext only.
+//! All sealed fields (`token`, `ehlo`, `pwd`) are hex strings of `nonce‖ct‖tag`
+//! produced by [`crate::crypto`]; the server only ever sees ciphertext. The `name`
+//! and `extra` fields are **plaintext** server-side — never put secrets there.
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +47,58 @@ pub struct ReSignRequest {
     pub ehlo: String,
 }
 
+/// `GET /group/list` item (plaintext).
+#[derive(Debug, Deserialize)]
+pub struct GroupSummary {
+    pub uuid: String,
+    pub name: String,
+    #[serde(default)]
+    pub extra: Option<String>,
+}
+
+/// One row from `GET /pwd/list/{valid,expired}`. `pwd` is sealed hex; `expires` is
+/// days remaining (always `0` on the expired list). No `name` here — only `get`
+/// returns it.
+#[derive(Debug, Deserialize)]
+pub struct PwdListItem {
+    pub uuid: String,
+    pub pwd: String,
+    #[serde(default)]
+    pub expires: i64,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub valid_since_days: i64,
+}
+
+/// Plaintext group reference embedded in a [`PwdDetail`].
+#[derive(Debug, Deserialize)]
+pub struct GroupRef {
+    pub name: String,
+    #[serde(default)]
+    pub extra: Option<String>,
+}
+
+/// `GET /pwd/get/{uuid}` — a full entry. `pwd` is sealed hex; `name`/`extra`/`group`
+/// are plaintext.
+#[derive(Debug, Deserialize)]
+pub struct PwdDetail {
+    pub uuid: String,
+    pub pwd: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub extra: Option<String>,
+    #[serde(default)]
+    pub expires: i64,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub valid_since_days: i64,
+    #[serde(default)]
+    pub group: Option<GroupRef>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +137,36 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, serde_json::json!({ "token": "cc", "ehlo": "dd" }));
+    }
+
+    #[test]
+    fn group_summary_deserializes() {
+        let g: GroupSummary =
+            serde_json::from_str(r#"{"uuid":"g1","name":"Work","extra":null}"#).unwrap();
+        assert_eq!(g.uuid, "g1");
+        assert_eq!(g.name, "Work");
+        assert!(g.extra.is_none());
+    }
+
+    #[test]
+    fn pwd_list_item_deserializes_with_sealed_pwd() {
+        let item: PwdListItem = serde_json::from_str(
+            r#"{"uuid":"p1","pwd":"deadbeef","expires":12,"created_at":"2026-06-20","valid_since_days":30}"#,
+        )
+        .unwrap();
+        assert_eq!(item.uuid, "p1");
+        assert_eq!(item.pwd, "deadbeef");
+        assert_eq!(item.expires, 12);
+    }
+
+    #[test]
+    fn pwd_detail_deserializes_with_group_and_optional_name() {
+        let d: PwdDetail = serde_json::from_str(
+            r#"{"uuid":"p1","pwd":"ab","expires":0,"valid_since_days":30,"group":{"name":"Work"}}"#,
+        )
+        .unwrap();
+        assert_eq!(d.uuid, "p1");
+        assert!(d.name.is_none());
+        assert_eq!(d.group.unwrap().name, "Work");
     }
 }
