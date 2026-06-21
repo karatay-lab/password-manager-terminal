@@ -9,5 +9,6 @@ pub mod app;
 pub mod config;
 pub mod crypto;
 pub mod message;
+pub mod secret;
 pub mod store;
 pub mod ui;
