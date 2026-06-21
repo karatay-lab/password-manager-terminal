@@ -13,7 +13,7 @@
 //!   `/re-sign` (re-binds the IP, but needs admin re-approval).
 
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use color_eyre::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -23,6 +23,7 @@ use zeroize::Zeroize;
 
 use crate::api::models::{PwdCreateRequest, PwdDetail, PwdListItem};
 use crate::api::{auth, vault, ApiClient, ApiError};
+use crate::clipboard::Clipboard;
 use crate::config::Config;
 use crate::crypto;
 use crate::message::{Command, Message};
@@ -62,6 +63,8 @@ pub enum Screen {
     AwaitingApproval,
     /// `/verify` returned 401 after unlock — offer re-sign or keep waiting.
     ReSignPrompt,
+    /// Confirm rotating the device token via `/refresh` (asks for the passphrase).
+    RefreshPrompt,
     /// The vault: a scrollable list of entries (valid or expired).
     Entries,
     /// One decrypted entry's fields.
@@ -337,15 +340,35 @@ pub struct App {
     pub entry_form: Option<EntryForm>,
     /// The new-group form, when that screen is active.
     pub group_form: Option<GroupForm>,
+    /// Active entries-list filter (`""` = no filter).
+    pub search: String,
+    /// Whether the entries list is currently capturing search keystrokes.
+    pub searching: bool,
+    /// Whether the help overlay is shown.
+    pub show_help: bool,
 
     /// The unlocked/enrolled identity. Secret — never rendered.
     identity: Option<StoreState>,
     api: ApiClient,
     store: Store,
+    clipboard: Clipboard,
     runtime: Runtime,
     tx: Sender<Message>,
     rx: Receiver<Message>,
+    /// Idle auto-lock window (`None` disables it). Measured from [`App::last_activity`].
+    idle_timeout: Option<Duration>,
+    /// When the user last pressed a key — drives idle auto-lock.
+    last_activity: Instant,
     running: bool,
+}
+
+impl Drop for App {
+    /// Wipe the passphrase fields on quit. Other secrets zeroize via their own `Drop`
+    /// (`identity`/`StoreState`, `entry_form`/`EntryForm`, `detail`/`PwdSecret`).
+    fn drop(&mut self) {
+        self.input.zeroize();
+        self.confirm.zeroize();
+    }
 }
 
 impl App {
@@ -354,6 +377,9 @@ impl App {
     pub fn new(config: Config) -> Result<Self> {
         let api = ApiClient::new(&config)?;
         let store = Store::new(&config);
+        let clipboard = Clipboard::new();
+        let idle_timeout =
+            (config.idle_lock_secs > 0).then(|| Duration::from_secs(config.idle_lock_secs));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -390,12 +416,18 @@ impl App {
             reveal: false,
             entry_form: None,
             group_form: None,
+            search: String::new(),
+            searching: false,
+            show_help: false,
             identity: None,
             api,
             store,
+            clipboard,
             runtime,
             tx,
             rx,
+            idle_timeout,
+            last_activity: Instant::now(),
             running: false,
         })
     }
@@ -409,6 +441,7 @@ impl App {
             if event::poll(EVENT_TICK)? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
+                        self.last_activity = Instant::now();
                         self.handle(Message::Key(key));
                     }
                 }
@@ -422,8 +455,49 @@ impl App {
             for msg in pending {
                 self.handle(msg);
             }
+
+            if self.idle_expired(Instant::now()) {
+                self.lock();
+            }
         }
         Ok(())
+    }
+
+    /// Whether the idle window has elapsed while the vault is unlocked. Gated on
+    /// `verified` so it protects a live session but never interrupts the
+    /// awaiting-approval poll (which gets no key presses). Pure (takes `now`) so it's
+    /// testable without sleeping.
+    fn idle_expired(&self, now: Instant) -> bool {
+        match self.idle_timeout {
+            Some(timeout) if self.verified => now.duration_since(self.last_activity) >= timeout,
+            _ => false,
+        }
+    }
+
+    /// Drop the in-memory identity and all decrypted vault state, wipe the clipboard,
+    /// and return to the unlock screen. Used by idle auto-lock.
+    fn lock(&mut self) {
+        self.identity = None; // StoreState is ZeroizeOnDrop
+        self.entries.clear();
+        self.detail = None;
+        self.groups.clear();
+        self.entry_form = None;
+        self.group_form = None;
+        self.search.clear();
+        self.searching = false;
+        self.show_help = false;
+        self.reveal = false;
+        self.verified = false;
+        self.busy = false;
+        self.input.zeroize();
+        self.clipboard.clear();
+        self.last_activity = Instant::now();
+        self.screen = if self.store.exists() {
+            Screen::Unlock
+        } else {
+            Screen::Enroll
+        };
+        self.status = Status::warning("Locked after inactivity — enter your passphrase to unlock.");
     }
 
     /// Apply a message, then run any commands it produced.
@@ -571,6 +645,25 @@ impl App {
                 self.status = Status::error(err);
                 vec![]
             }
+
+            Message::ClipboardCleared => {
+                self.status = Status::info("Clipboard cleared.");
+                vec![]
+            }
+            Message::TokenRefreshed(state) => {
+                self.identity = Some(*state);
+                self.busy = false;
+                self.input.zeroize();
+                self.screen = Screen::Entries;
+                self.status = Status::success("Device token rotated and saved.");
+                vec![]
+            }
+            Message::RefreshFailed(err) => {
+                self.busy = false;
+                self.input.zeroize();
+                self.status = Status::error(format!("Token refresh failed: {err}"));
+                vec![]
+            }
         }
     }
 
@@ -580,10 +673,16 @@ impl App {
             self.running = false;
             return vec![];
         }
+        // The help overlay swallows the next key press to dismiss itself.
+        if self.show_help {
+            self.show_help = false;
+            return vec![];
+        }
         match self.screen {
             Screen::Unlock => self.on_key_unlock(key),
             Screen::Enroll => self.on_key_enroll(key),
             Screen::ReSignPrompt => self.on_key_resign(key),
+            Screen::RefreshPrompt => self.on_key_refresh(key),
             Screen::Entries => self.on_key_entries(key),
             Screen::Groups => self.on_key_groups(key),
             Screen::EntryDetail => self.on_key_detail(key),
@@ -708,26 +807,77 @@ impl App {
         }
     }
 
+    /// Indices into [`App::entries`] that match the active search filter.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| entry_matches(row, &self.search))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     fn on_key_entries(&mut self, key: KeyEvent) -> Vec<Command> {
+        if self.searching {
+            match key.code {
+                KeyCode::Esc => {
+                    self.search.clear();
+                    self.searching = false;
+                    self.selected = 0;
+                }
+                KeyCode::Enter => self.searching = false,
+                KeyCode::Backspace => {
+                    self.search.pop();
+                    self.selected = 0;
+                }
+                KeyCode::Char(c) => {
+                    self.search.push(c);
+                    self.selected = 0;
+                }
+                _ => {}
+            }
+            return vec![];
+        }
+        // Ctrl+R rotates the device token (distinct from `r` = refresh the list).
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+            self.input.clear();
+            self.screen = Screen::RefreshPrompt;
+            self.status =
+                Status::info("Rotate device token — enter your master passphrase to confirm.");
+            return vec![];
+        }
         match key.code {
             KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
                 vec![]
             }
             KeyCode::Down => {
-                if self.selected + 1 < self.entries.len() {
+                if self.selected + 1 < self.visible_indices().len() {
                     self.selected += 1;
                 }
                 vec![]
             }
-            KeyCode::Enter => match self.entries.get(self.selected) {
-                Some(row) => {
-                    let uuid = row.uuid.clone();
-                    self.status = Status::info("Loading entry…");
-                    vec![Command::LoadEntry { uuid }]
+            KeyCode::Enter => {
+                let target = self
+                    .visible_indices()
+                    .get(self.selected)
+                    .and_then(|&i| self.entries.get(i))
+                    .map(|row| row.uuid.clone());
+                match target {
+                    Some(uuid) => {
+                        self.status = Status::info("Loading entry…");
+                        vec![Command::LoadEntry { uuid }]
+                    }
+                    None => vec![],
                 }
-                None => vec![],
-            },
+            }
+            KeyCode::Char('/') => {
+                self.searching = true;
+                self.selected = 0;
+                self.status =
+                    Status::info("Search — type to filter, Enter to accept, Esc to clear.");
+                vec![]
+            }
             KeyCode::Char('t') => {
                 let expired = !self.show_expired;
                 self.status = Status::info("Loading…");
@@ -743,6 +893,10 @@ impl App {
                 self.status = Status::info("Refreshing…");
                 vec![Command::LoadPasswords { expired }]
             }
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                vec![]
+            }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.running = false;
                 vec![]
@@ -757,6 +911,10 @@ impl App {
                 self.group_form = Some(GroupForm::blank());
                 self.screen = Screen::NewGroup;
                 self.status = Status::info("New group — Tab to move, Enter to save.");
+                vec![]
+            }
+            KeyCode::Char('?') => {
+                self.show_help = true;
                 vec![]
             }
             KeyCode::Esc => {
@@ -778,6 +936,12 @@ impl App {
                 vec![]
             }
             KeyCode::Char('e') => self.open_renew_entry(),
+            KeyCode::Char('c') => self.copy_password(),
+            KeyCode::Char('u') => self.copy_username(),
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                vec![]
+            }
             KeyCode::Esc => {
                 self.detail = None;
                 self.reveal = false;
@@ -786,6 +950,76 @@ impl App {
             }
             KeyCode::Char('q') => {
                 self.running = false;
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    fn copy_password(&mut self) -> Vec<Command> {
+        let text = match &self.detail {
+            Some(d) => d.secret.password.clone(),
+            None => return vec![],
+        };
+        self.copy_to_clipboard(text, "Password")
+    }
+
+    fn copy_username(&mut self) -> Vec<Command> {
+        let text = match &self.detail {
+            Some(d) => d.secret.username.clone(),
+            None => return vec![],
+        };
+        self.copy_to_clipboard(text, "Username")
+    }
+
+    /// Copy `text` to the clipboard and, if a clear window is configured, schedule the
+    /// auto-clear. Reports gracefully when no clipboard backend is available.
+    fn copy_to_clipboard(&mut self, text: String, label: &str) -> Vec<Command> {
+        if text.is_empty() {
+            self.status = Status::warning(format!("{label} is empty — nothing to copy."));
+            return vec![];
+        }
+        if !self.clipboard.set(&text) {
+            self.status = Status::error("Clipboard unavailable in this environment.");
+            return vec![];
+        }
+        let secs = self.config.clipboard_clear_secs;
+        if secs > 0 {
+            self.status = Status::success(format!("{label} copied — clears in {secs}s."));
+            vec![Command::ClearClipboardAfter { secs }]
+        } else {
+            self.status = Status::success(format!("{label} copied."));
+            vec![]
+        }
+    }
+
+    fn on_key_refresh(&mut self, key: KeyEvent) -> Vec<Command> {
+        if self.busy {
+            return vec![];
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.input.zeroize();
+                self.screen = Screen::Entries;
+                self.status = Status::info("Token rotation cancelled.");
+                vec![]
+            }
+            KeyCode::Enter => {
+                if self.input.is_empty() {
+                    self.status = Status::warning("Enter your master passphrase to confirm.");
+                    return vec![];
+                }
+                let passphrase = std::mem::take(&mut self.input);
+                self.busy = true;
+                self.status = Status::info("Rotating token…");
+                vec![Command::RefreshToken { passphrase }]
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+                vec![]
+            }
+            KeyCode::Char(c) => {
+                self.input.push(c);
                 vec![]
             }
             _ => vec![],
@@ -1192,6 +1426,31 @@ impl App {
                     let _ = tx.send(msg);
                 });
             }
+            Command::ClearClipboardAfter { secs } => {
+                let clipboard = self.clipboard.clone();
+                self.runtime.spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                    clipboard.clear();
+                    let _ = tx.send(Message::ClipboardCleared);
+                });
+            }
+            Command::RefreshToken { passphrase } => {
+                let store = self.store.clone();
+                let identity = match &self.identity {
+                    Some(state) => state.clone(),
+                    None => return,
+                };
+                self.runtime.spawn(async move {
+                    let mut passphrase = passphrase;
+                    let outcome = refresh_token(&client, &store, &identity, &passphrase).await;
+                    passphrase.zeroize();
+                    let msg = match outcome {
+                        Ok(state) => Message::TokenRefreshed(Box::new(state)),
+                        Err(e) => Message::RefreshFailed(e),
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
         }
     }
 
@@ -1254,6 +1513,15 @@ fn validate_entry_form(
     Ok((secret, group_id, name, valid_since_days))
 }
 
+/// Case-insensitive substring match of `query` against an entry's username/url.
+fn entry_matches(row: &EntryRow, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let q = query.to_lowercase();
+    row.username.to_lowercase().contains(&q) || row.url.to_lowercase().contains(&q)
+}
+
 /// Build a display-ready error string for a failed vault read, turning the generic
 /// 401 into the actionable hint the backend can't give us (plan §9).
 fn vault_error(action: &str, err: &ApiError) -> String {
@@ -1304,11 +1572,55 @@ async fn enroll(client: &ApiClient, store: &Store, passphrase: &str) -> Result<S
     Ok(state)
 }
 
+/// Rotate the device token via `/refresh`, then persist the new token to the store.
+///
+/// `/refresh` is looked up by source IP and returns a fresh raw token; both `token`
+/// and `ehlo` in the request are sealed under the shared key. The old token is now
+/// invalid, so we must re-encrypt the store under `passphrase` with the new one.
+async fn refresh_token(
+    client: &ApiClient,
+    store: &Store,
+    identity: &StoreState,
+    passphrase: &str,
+) -> Result<StoreState, String> {
+    let shared = identity.shared_key();
+    let sealed_token = crypto::seal_hex(identity.device_token.as_bytes(), &shared);
+    let sealed_ehlo = crypto::seal_hex(identity.ehlo_secret.as_bytes(), &shared);
+
+    let new_token = auth::refresh(client, &sealed_token, &sealed_ehlo)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut state = identity.clone();
+    state.device_token = new_token;
+
+    let to_save = state.clone();
+    let store = store.clone();
+    let passphrase = passphrase.to_string();
+    tokio::task::spawn_blocking(move || store.save(&to_save, &passphrase))
+        .await
+        .map_err(|e| format!("save task failed: {e}"))?
+        .map_err(|e| e.to_string())?;
+
+    Ok(state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::crossterm::event::KeyModifiers;
     use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    fn dummy_state() -> StoreState {
+        StoreState {
+            client_private: [1u8; 32],
+            client_public: [2u8; 32],
+            server_public: [3u8; 32],
+            device_token: "tok".into(),
+            ehlo_secret: "ehlo".into(),
+        }
+    }
 
     fn config_in(dir: &Path) -> Config {
         Config {
@@ -1317,6 +1629,7 @@ mod tests {
             verify_tls: true,
             data_dir: dir.to_string_lossy().into_owned(),
             clipboard_clear_secs: 30,
+            idle_lock_secs: 300,
         }
     }
 
@@ -1837,5 +2150,153 @@ mod tests {
             cmds.as_slice(),
             [Command::LoadPasswords { expired: false }]
         ));
+    }
+
+    // ---- M6: secure copy & polish ----
+
+    #[test]
+    fn search_filters_by_username() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.entries = rows(&[("a", "alice"), ("b", "bob"), ("c", "alistair")]);
+        app.search = "ali".into();
+        assert_eq!(app.visible_indices(), vec![0, 2]);
+    }
+
+    #[test]
+    fn entries_slash_enters_search_then_esc_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::Entries;
+        app.entries = rows(&[("a", "alice"), ("b", "bob")]);
+
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.searching);
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(app.search, "b");
+        assert_eq!(app.visible_indices(), vec![1]);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.searching);
+        assert!(app.search.is_empty());
+    }
+
+    #[test]
+    fn enter_opens_uuid_from_filtered_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::Entries;
+        app.entries = rows(&[("a", "alice"), ("b", "bob")]);
+        app.search = "bob".into();
+        // Filtered list has one row (bob) at index 0.
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(cmds.as_slice(), [Command::LoadEntry { uuid }] if uuid == "b"));
+    }
+
+    #[test]
+    fn help_opens_and_any_key_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::Entries;
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.show_help);
+        press(&mut app, KeyCode::Down); // any key dismisses
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn idle_expired_needs_verified_and_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.idle_timeout = Some(Duration::ZERO);
+
+        app.verified = false; // e.g. still awaiting approval — never auto-lock
+        assert!(!app.idle_expired(Instant::now()));
+
+        app.verified = true; // live vault session
+        assert!(app.idle_expired(Instant::now()));
+
+        app.idle_timeout = None; // disabled
+        assert!(!app.idle_expired(Instant::now()));
+    }
+
+    #[test]
+    fn lock_wipes_state_and_returns_to_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(&config_in(dir.path()));
+        std::fs::write(store.path(), b"PWMS-pretend-store").unwrap();
+        let mut app = app_in(dir.path());
+
+        app.identity = Some(dummy_state());
+        app.verified = true;
+        app.entries = rows(&[("a", "alice")]);
+        app.search = "x".into();
+        app.screen = Screen::Entries;
+
+        app.lock();
+        assert!(app.identity.is_none());
+        assert!(app.entries.is_empty());
+        assert!(!app.verified);
+        assert!(app.search.is_empty());
+        assert_eq!(app.screen, Screen::Unlock);
+        assert_eq!(app.status.kind, StatusKind::Warning);
+    }
+
+    #[test]
+    fn ctrl_r_opens_refresh_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::Entries;
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.screen, Screen::RefreshPrompt);
+    }
+
+    #[test]
+    fn refresh_prompt_enter_emits_refresh_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::RefreshPrompt;
+        type_str(&mut app, "masterpw");
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            matches!(cmds.as_slice(), [Command::RefreshToken { passphrase }] if passphrase == "masterpw")
+        );
+        assert!(app.busy);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn copy_empty_password_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::EntryDetail;
+        app.detail = Some(DetailView {
+            name: None,
+            group: None,
+            expires: 1,
+            valid_since_days: 30,
+            created_at: String::new(),
+            secret: PwdSecret::default(), // empty password
+        });
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        )));
+        assert!(cmds.is_empty());
+        assert_eq!(app.status.kind, StatusKind::Warning);
+    }
+
+    #[test]
+    fn clipboard_cleared_sets_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let cmds = app.update(Message::ClipboardCleared);
+        assert!(cmds.is_empty());
+        assert_eq!(app.status.kind, StatusKind::Info);
     }
 }

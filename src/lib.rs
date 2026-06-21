@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod app;
+pub mod clipboard;
 pub mod config;
 pub mod crypto;
 pub mod message;

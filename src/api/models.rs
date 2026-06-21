@@ -47,6 +47,24 @@ pub struct ReSignRequest {
     pub ehlo: String,
 }
 
+/// `POST /refresh` request — rotate the device token (looked up by source IP).
+///
+/// Both fields are sealed hex: `token` = `hex(seal(current_token))` and `ehlo` =
+/// `hex(seal(ehlo_secret))`. Same shape as [`RegisterRequest`], distinct intent.
+#[derive(Debug, Serialize)]
+pub struct RefreshRequest {
+    /// Sealed *current* device token, hex.
+    pub token: String,
+    /// Sealed ehlo secret, hex.
+    pub ehlo: String,
+}
+
+/// `POST /refresh` response — the new raw device token to persist.
+#[derive(Debug, Deserialize)]
+pub struct RefreshResponse {
+    pub token: String,
+}
+
 /// `POST /group/create` request. `name` ≤128 chars (server-enforced); `extra` is
 /// optional plaintext metadata.
 #[derive(Debug, Serialize)]
@@ -163,6 +181,12 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, serde_json::json!({ "token": "cc", "ehlo": "dd" }));
+    }
+
+    #[test]
+    fn refresh_response_deserializes_new_token() {
+        let resp: RefreshResponse = serde_json::from_str(r#"{"token":"new-raw-uuid"}"#).unwrap();
+        assert_eq!(resp.token, "new-raw-uuid");
     }
 
     #[test]

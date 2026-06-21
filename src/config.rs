@@ -16,6 +16,8 @@ pub struct Config {
     pub data_dir: String,
     /// Seconds after which copied secrets are wiped from the clipboard.
     pub clipboard_clear_secs: u64,
+    /// Seconds of inactivity after which the vault auto-locks (`0` disables it).
+    pub idle_lock_secs: u64,
 }
 
 impl Config {
@@ -27,6 +29,7 @@ impl Config {
             verify_tls: parse_env("PWM_VERIFY_TLS", true),
             data_dir: env::var("PWM_DATA_DIR").unwrap_or_else(|_| "~/.pwd-manager".to_string()),
             clipboard_clear_secs: parse_env("PWM_CLIPBOARD_CLEAR_SECS", 30),
+            idle_lock_secs: parse_env("PWM_IDLE_LOCK_SECS", 300),
         }
     }
 }

@@ -58,6 +58,13 @@ pub enum Message {
     EntryCreated,
     /// A vault write (create group/entry) failed; message is display-ready.
     WriteFailed(String),
+
+    /// The clipboard auto-clear timer fired and wiped the clipboard.
+    ClipboardCleared,
+    /// `/refresh` rotated the device token and the new store was persisted.
+    TokenRefreshed(Box<StoreState>),
+    /// `/refresh` failed (network, or not at the registered IP).
+    RefreshFailed(String),
 }
 
 /// Async work requested by `App::update`, executed on the tokio runtime.
@@ -88,4 +95,9 @@ pub enum Command {
         name: Option<String>,
         valid_since_days: i64,
     },
+    /// Clear the clipboard after `secs` seconds (the copy auto-clear timer).
+    ClearClipboardAfter { secs: u64 },
+    /// Rotate the device token via `/refresh`, then re-encrypt the store under
+    /// `passphrase`. The passphrase is zeroized once consumed.
+    RefreshToken { passphrase: String },
 }
