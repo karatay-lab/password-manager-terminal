@@ -83,6 +83,7 @@ mod tests {
             verify_tls: true,
             data_dir: "~/.pwd-manager".into(),
             clipboard_clear_secs: 30,
+            idle_lock_secs: 300,
         };
         let client = ApiClient::new(&cfg).unwrap();
         assert_eq!(client.url("/greet"), "http://localhost:53971/greet");

@@ -40,8 +40,8 @@ Must-have:
 - **Copy** username/password to clipboard with auto-clear.
 - **Search/filter** entries; clean lock/quit that wipes secrets from memory.
 
-**❓DECIDE — v1 cuts:** which of {create group in-app, expired-list view, password
-generator, token `/refresh` UI, search} ship in v1 vs v2?
+**✅ DECIDED (M6) — v1 cuts:** none cut. All of {create group in-app, expired-list
+view, password generator, token `/refresh` UI, search} ship in v1.
 
 ## 3. Non-goals for v1
 
@@ -118,7 +118,7 @@ this is the conventional model for a password manager. Implemented in `src/store
 
 Either way: `secrecy::SecretString` in memory, `zeroize` on drop, no logging of
 secrets, clipboard auto-clear (`PWM_CLIPBOARD_CLEAR_SECS`, default 30s).
-**❓DECIDE:** idle auto-lock in v1 or v2?
+**✅ DECIDED (M6):** idle auto-lock ships in v1 (`PWM_IDLE_LOCK_SECS`, default 300s, 0 disables).
 
 ## 7. Proposed module layout
 
@@ -221,6 +221,17 @@ to go back/quit, single-letter actions (`n` new, `e` edit, `c` copy, `r` re-sign
     End-to-end vs a live backend still pending.
 - **M6 — secure copy & polish:** clipboard auto-clear, zeroize audit, search, help,
   error hints, usage docs.
+  - ✅ `crate::clipboard::Clipboard` — native (`arboard`, text-only) on a dedicated
+    thread, degrades gracefully when unavailable (headless/SSH). Detail screen: `c`
+    copy password, `u` copy username; auto-clear after `PWM_CLIPBOARD_CLEAR_SECS`.
+  - ✅ **Search** (`/` on Entries, case-insensitive username/URL filter), **help
+    overlay** (`?`), **idle auto-lock** (`PWM_IDLE_LOCK_SECS`, def 300, 0=off → drops
+    identity + wipes clipboard → Unlock), **token `/refresh` UI** (`Ctrl+R` →
+    passphrase-confirmed `auth::refresh` → re-encrypt store with the new token).
+  - ✅ **Zeroize audit:** `StoreState`/`PwdSecret`/`EntryForm` wipe on drop; `App`
+    wipes passphrase fields on drop; passphrases zeroized after every use.
+  - ✅ **Docs:** README (workflow, keymap, config, security model) + `.env.example`.
+  - ⚠️ Clipboard/`/refresh` not exercised against a live backend / real display here.
 
 ## 11. Open questions (consolidated)
 
@@ -231,17 +242,21 @@ to go back/quit, single-letter actions (`n` new, `e` edit, `c` copy, `r` re-sign
 - [x] ~~`pwd` JSON schema fields~~ — **DECIDED (M4): `{username,password,url,notes}`**
   (`crate::secret::PwdSecret`); `name`/`extra` stay server-plaintext, no secrets there.
 - [x] ~~password generator in v1?~~ — **DECIDED (M5): yes**, in the new-entry form (`Ctrl+G`).
-- [ ] v1 scope cuts (§2) — remaining open: token `/refresh` UI, search (→ M6).
-- [ ] idle auto-lock in v1? (§6)
+- [x] ~~v1 scope cuts (§2)~~ — **DECIDED (M6): all ship** (create group, expired view,
+  generator, token `/refresh` UI, search) — none cut to v2.
+- [x] ~~idle auto-lock in v1? (§6)~~ — **DECIDED (M6): yes** (`PWM_IDLE_LOCK_SECS`, def 300s).
 
 ---
 
 ### Next step
 
-M0–M5 landed (scaffold, crypto core, enrollment, session loop, read-side vault, and
-write-side: new-entry/new-group forms, password generator, renew-as-new-create).
-**M6 — secure copy & polish:** clipboard copy of username/password with auto-clear
-(`Config::clipboard_clear_secs` already exists), entry search/filter on the list,
-a help overlay, a final zeroize audit, and usage docs. Decide there: clipboard
-backend (e.g. `arboard`) and whether to ship idle auto-lock (§6) / token `/refresh`
-UI in v1.
+**M0–M6 all landed — v1 feature-complete.** Scaffold, crypto core, enrollment,
+session loop, read-side vault, write-side forms + generator, and polish (clipboard
+copy/auto-clear, search, help overlay, idle auto-lock, token `/refresh`, zeroize
+audit, docs).
+
+Remaining before a real release is **end-to-end validation against a live backend** —
+every milestone's network/crypto path is unit-tested but no server was available in
+the dev environment, so enroll → approve → unlock → CRUD → copy → refresh should be
+run against a real instance to shake out wire-shape nits. Open §2/§6 questions are
+all resolved.

@@ -260,6 +260,7 @@ mod tests {
             verify_tls: true,
             data_dir: dir.to_string_lossy().into_owned(),
             clipboard_clear_secs: 30,
+            idle_lock_secs: 300,
         }
     }
 

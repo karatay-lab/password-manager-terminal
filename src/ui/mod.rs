@@ -23,23 +23,28 @@ pub fn view(app: &App, frame: &mut Frame) {
 
     frame.render_widget(Line::from(" pwd-manager ".bold().reversed()), title);
 
-    match app.screen {
-        Screen::Unlock => render_unlock(app, frame, body),
-        Screen::Enroll => render_enroll(app, frame, body),
-        Screen::Connecting => render_card(
-            frame,
-            body,
-            "Connecting",
-            vec![Line::raw("Verifying with the server…")],
-            7,
-        ),
-        Screen::AwaitingApproval => render_awaiting(frame, body),
-        Screen::ReSignPrompt => render_resign(frame, body),
-        Screen::Entries => render_entries(app, frame, body),
-        Screen::Groups => render_groups(app, frame, body),
-        Screen::EntryDetail => render_detail(app, frame, body),
-        Screen::NewEntry => render_new_entry(app, frame, body),
-        Screen::NewGroup => render_new_group(app, frame, body),
+    if app.show_help {
+        render_help(frame, body);
+    } else {
+        match app.screen {
+            Screen::Unlock => render_unlock(app, frame, body),
+            Screen::Enroll => render_enroll(app, frame, body),
+            Screen::Connecting => render_card(
+                frame,
+                body,
+                "Connecting",
+                vec![Line::raw("Verifying with the server…")],
+                7,
+            ),
+            Screen::AwaitingApproval => render_awaiting(frame, body),
+            Screen::ReSignPrompt => render_resign(frame, body),
+            Screen::RefreshPrompt => render_refresh(app, frame, body),
+            Screen::Entries => render_entries(app, frame, body),
+            Screen::Groups => render_groups(app, frame, body),
+            Screen::EntryDetail => render_detail(app, frame, body),
+            Screen::NewEntry => render_new_entry(app, frame, body),
+            Screen::NewGroup => render_new_group(app, frame, body),
+        }
     }
 
     render_status(app, frame, status);
@@ -124,20 +129,27 @@ fn render_entries(app: &App, frame: &mut Frame, area: Rect) {
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
 
     let scope = if app.show_expired { "expired" } else { "valid" };
-    let block = Block::bordered().title(format!(" Entries ({scope}) "));
+    let visible = app.visible_indices();
+    let title = if app.search.is_empty() {
+        format!(" Entries ({scope}) ")
+    } else {
+        format!(" Entries ({scope}) · /{} ", app.search)
+    };
+    let block = Block::bordered().title(title);
 
-    if app.entries.is_empty() {
-        let msg = Paragraph::new(vec![
-            Line::raw(""),
-            Line::from(format!("No {scope} entries.").dim()),
-        ])
-        .block(block);
+    if visible.is_empty() {
+        let note = if app.search.is_empty() {
+            format!("No {scope} entries.")
+        } else {
+            format!("No matches for “{}”.", app.search)
+        };
+        let msg = Paragraph::new(vec![Line::raw(""), Line::from(note.dim())]).block(block);
         frame.render_widget(msg, list_area);
     } else {
-        let items: Vec<ListItem> = app
-            .entries
+        let items: Vec<ListItem> = visible
             .iter()
-            .map(|e| {
+            .map(|&i| {
+                let e = &app.entries[i];
                 let when = if app.show_expired {
                     "expired".to_string()
                 } else {
@@ -160,13 +172,15 @@ fn render_entries(app: &App, frame: &mut Frame, area: Rect) {
         frame.render_stateful_widget(list, list_area, &mut state);
     }
 
-    frame.render_widget(
+    let hint = if app.searching {
+        Line::from(format!("Search: {}_", app.search)).fg(Color::Cyan)
+    } else {
         Line::from(
-            "↑/↓ move · Enter open · n new · t valid/expired · g groups · r refresh · Esc quit",
+            "↑/↓ · Enter open · n new · / search · t valid/expired · g groups · r refresh · ? help",
         )
-        .dim(),
-        hint_area,
-    );
+        .dim()
+    };
+    frame.render_widget(hint, hint_area);
 }
 
 fn render_groups(app: &App, frame: &mut Frame, area: Rect) {
@@ -235,13 +249,56 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
         field("Created", &detail.created_at),
         Line::raw(""),
         Line::from(if app.reveal {
-            "s hide · e renew · Esc back · q quit"
+            "s hide · c copy pwd · u copy user · e renew · Esc back · ? help"
         } else {
-            "s reveal · e renew · Esc back · q quit"
+            "s reveal · c copy pwd · u copy user · e renew · Esc back · ? help"
         })
         .dim(),
     ];
     render_card(frame, area, "Entry", lines, 16);
+}
+
+fn render_refresh(app: &App, frame: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from("Rotate device token".bold()),
+        Line::raw(""),
+        Line::raw("Requests a fresh device token from the server (keeps approval, but"),
+        Line::raw("must be at your registered IP). The new token is saved to your local"),
+        Line::raw("store, so confirm with your master passphrase."),
+        Line::raw(""),
+        Line::from(format!("Passphrase: {}_", mask(&app.input))),
+        Line::raw(""),
+        Line::raw("Enter confirm · Esc cancel").dim(),
+    ];
+    render_card(frame, area, "Refresh token", lines, 13);
+}
+
+fn render_help(frame: &mut Frame, area: Rect) {
+    let key = |k: &str, desc: &str| {
+        Line::from(vec![format!("  {k:<10}").bold(), desc.to_string().into()])
+    };
+    let lines = vec![
+        Line::from("Entries".bold().fg(Color::Cyan)),
+        key("↑/↓", "move · Enter opens the selected entry"),
+        key("/", "search (filters by username/URL) · Esc clears"),
+        key("n", "new entry · t toggle valid/expired · r refresh list"),
+        key("g", "groups · Ctrl+R rotate device token · q quit"),
+        Line::raw(""),
+        Line::from("Entry detail".bold().fg(Color::Cyan)),
+        key(
+            "s",
+            "reveal/hide password · c copy password · u copy username",
+        ),
+        key("e", "renew (saves a new entry) · Esc back"),
+        Line::raw(""),
+        Line::from("Groups".bold().fg(Color::Cyan)),
+        key("n", "new group · Esc back"),
+        Line::raw(""),
+        Line::raw("Copied secrets auto-clear from the clipboard. The vault locks after idle.")
+            .dim(),
+        Line::raw("Press any key to close.").dim(),
+    ];
+    render_card(frame, area, "Help", lines, 19);
 }
 
 fn render_new_entry(app: &App, frame: &mut Frame, area: Rect) {

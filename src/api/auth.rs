@@ -8,7 +8,9 @@
 
 use super::client::{check_status, ApiClient, DEVICE_TOKEN_HEADER};
 use super::error::ApiError;
-use super::models::{GreetRequest, GreetResponse, ReSignRequest, RegisterRequest};
+use super::models::{
+    GreetRequest, GreetResponse, ReSignRequest, RefreshRequest, RefreshResponse, RegisterRequest,
+};
 
 /// `POST /greet` — send our X25519 public key, return the server's public key.
 ///
@@ -89,6 +91,32 @@ pub async fn re_sign(
         .await?;
     check_status(resp).await?;
     Ok(())
+}
+
+/// `POST /refresh` — rotate the device token, returning the new raw token.
+///
+/// Looked up by source IP (no `device-token` header) and **keeps** confirmation, so
+/// unlike [`re_sign`] no admin re-approval is needed — but the caller must be at the
+/// registered IP. Both args are `hex(seal(..))`. Persist the returned token: the old
+/// one is now invalid.
+pub async fn refresh(
+    client: &ApiClient,
+    sealed_token_hex: &str,
+    sealed_ehlo_hex: &str,
+) -> Result<String, ApiError> {
+    let body = RefreshRequest {
+        token: sealed_token_hex.to_string(),
+        ehlo: sealed_ehlo_hex.to_string(),
+    };
+    let resp = client
+        .http()
+        .post(client.url("/refresh"))
+        .json(&body)
+        .send()
+        .await?;
+    let resp = check_status(resp).await?;
+    let parsed: RefreshResponse = resp.json().await?;
+    Ok(parsed.token)
 }
 
 /// Decode a hex server public key into a fixed 32-byte array, with clear errors.
