@@ -21,7 +21,7 @@ use ratatui::DefaultTerminal;
 use tokio::runtime::Runtime;
 use zeroize::Zeroize;
 
-use crate::api::models::{PwdDetail, PwdListItem};
+use crate::api::models::{PwdCreateRequest, PwdDetail, PwdListItem};
 use crate::api::{auth, vault, ApiClient, ApiError};
 use crate::config::Config;
 use crate::crypto;
@@ -37,6 +37,17 @@ const POLL_INTERVAL_MS: u64 = 3000;
 const EVENT_TICK: Duration = Duration::from_millis(100);
 /// Minimum master-passphrase length accepted at enrollment.
 const MIN_PASSPHRASE_LEN: usize = 8;
+/// Length of a password produced by the in-form generator.
+const GENERATED_PASSWORD_LEN: usize = 20;
+/// Default expiry window for a new entry when the field is left blank.
+const DEFAULT_VALID_DAYS: i64 = 30;
+/// Server-enforced bounds for `valid_since_days`.
+const MIN_VALID_DAYS: i64 = 1;
+const MAX_VALID_DAYS: i64 = 365;
+/// Server-enforced max group-name length.
+const MAX_GROUP_NAME_LEN: usize = 128;
+/// Server-enforced max entry-name length.
+const MAX_ENTRY_NAME_LEN: usize = 256;
 
 /// Which screen is currently shown (and therefore how input is interpreted).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -55,8 +66,12 @@ pub enum Screen {
     Entries,
     /// One decrypted entry's fields.
     EntryDetail,
-    /// The list of groups (read-only in v1's M4).
+    /// The list of groups.
     Groups,
+    /// Form to create a new entry (also used to renew an existing one).
+    NewEntry,
+    /// Form to create a new group.
+    NewGroup,
 }
 
 /// Which field the enroll form's cursor is on.
@@ -64,6 +79,48 @@ pub enum Screen {
 pub enum EnrollField {
     Passphrase,
     Confirm,
+}
+
+/// Which field the new-entry form's cursor is on (in tab order).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EntryField {
+    Name,
+    Group,
+    Username,
+    Password,
+    Url,
+    Notes,
+    ValidDays,
+}
+
+impl EntryField {
+    /// Fields in tab order.
+    const ORDER: [EntryField; 7] = [
+        EntryField::Name,
+        EntryField::Group,
+        EntryField::Username,
+        EntryField::Password,
+        EntryField::Url,
+        EntryField::Notes,
+        EntryField::ValidDays,
+    ];
+
+    fn next(self) -> Self {
+        let i = Self::ORDER.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ORDER[(i + 1) % Self::ORDER.len()]
+    }
+
+    fn prev(self) -> Self {
+        let i = Self::ORDER.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ORDER[(i + Self::ORDER.len() - 1) % Self::ORDER.len()]
+    }
+}
+
+/// Which field the new-group form's cursor is on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GroupField {
+    Name,
+    Extra,
 }
 
 /// A decrypted row shown in the entries list. Carries only the label fields
@@ -76,10 +133,87 @@ pub struct EntryRow {
     pub expires: i64,
 }
 
-/// A group as shown in the groups list.
+/// A group as shown in the groups list. `uuid` is needed to file new entries.
 pub struct GroupRow {
+    pub uuid: String,
     pub name: String,
     pub extra: Option<String>,
+}
+
+/// The new-entry / renew form. Text fields are edited in place; `group_idx`
+/// indexes into [`App::groups`]. Secret fields are zeroized on drop.
+pub struct EntryForm {
+    pub name: String,
+    pub username: String,
+    pub password: String,
+    pub url: String,
+    pub notes: String,
+    pub valid_days: String,
+    pub group_idx: usize,
+    pub field: EntryField,
+    /// True when pre-filled from an existing entry (a renew → fresh create).
+    pub renewing: bool,
+}
+
+impl EntryForm {
+    fn blank(group_idx: usize) -> Self {
+        Self {
+            name: String::new(),
+            username: String::new(),
+            password: String::new(),
+            url: String::new(),
+            notes: String::new(),
+            valid_days: DEFAULT_VALID_DAYS.to_string(),
+            group_idx,
+            field: EntryField::Name,
+            renewing: false,
+        }
+    }
+
+    /// The text field under the cursor, or `None` when the group picker is focused.
+    fn focused_mut(&mut self) -> Option<&mut String> {
+        match self.field {
+            EntryField::Name => Some(&mut self.name),
+            EntryField::Username => Some(&mut self.username),
+            EntryField::Password => Some(&mut self.password),
+            EntryField::Url => Some(&mut self.url),
+            EntryField::Notes => Some(&mut self.notes),
+            EntryField::ValidDays => Some(&mut self.valid_days),
+            EntryField::Group => None,
+        }
+    }
+}
+
+impl Drop for EntryForm {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.username.zeroize();
+        self.notes.zeroize();
+    }
+}
+
+/// The new-group form. Both fields are server-plaintext (no secrets).
+pub struct GroupForm {
+    pub name: String,
+    pub extra: String,
+    pub field: GroupField,
+}
+
+impl GroupForm {
+    fn blank() -> Self {
+        Self {
+            name: String::new(),
+            extra: String::new(),
+            field: GroupField::Name,
+        }
+    }
+
+    fn focused_mut(&mut self) -> &mut String {
+        match self.field {
+            GroupField::Name => &mut self.name,
+            GroupField::Extra => &mut self.extra,
+        }
+    }
 }
 
 /// A fully decrypted entry for the detail screen. `secret` zeroizes on drop.
@@ -199,6 +333,10 @@ pub struct App {
     pub detail: Option<DetailView>,
     /// Whether the detail screen reveals the password in clear text.
     pub reveal: bool,
+    /// The new-entry/renew form, when that screen is active.
+    pub entry_form: Option<EntryForm>,
+    /// The new-group form, when that screen is active.
+    pub group_form: Option<GroupForm>,
 
     /// The unlocked/enrolled identity. Secret — never rendered.
     identity: Option<StoreState>,
@@ -250,6 +388,8 @@ impl App {
             groups: Vec::new(),
             detail: None,
             reveal: false,
+            entry_form: None,
+            group_form: None,
             identity: None,
             api,
             store,
@@ -331,7 +471,11 @@ impl App {
                 self.busy = false;
                 self.screen = Screen::Entries;
                 self.status = Status::info("Session established — loading entries…");
-                vec![Command::LoadPasswords { expired: false }]
+                // Load groups too (quietly) so the new-entry picker is ready.
+                vec![
+                    Command::LoadPasswords { expired: false },
+                    Command::LoadGroups { show: false },
+                ]
             }
             Message::VerifyUnauthorized => match self.screen {
                 Screen::AwaitingApproval => {
@@ -384,12 +528,14 @@ impl App {
                 ));
                 vec![]
             }
-            Message::GroupsLoaded(rows) => {
+            Message::GroupsLoaded { rows, show } => {
                 self.groups = rows;
-                self.screen = Screen::Groups;
-                let n = self.groups.len();
-                self.status =
-                    Status::info(format!("{n} {}", if n == 1 { "group" } else { "groups" }));
+                if show {
+                    self.screen = Screen::Groups;
+                    let n = self.groups.len();
+                    self.status =
+                        Status::info(format!("{n} {}", if n == 1 { "group" } else { "groups" }));
+                }
                 vec![]
             }
             Message::EntryLoaded(detail) => {
@@ -400,6 +546,27 @@ impl App {
                 vec![]
             }
             Message::VaultFailed(err) => {
+                self.busy = false;
+                self.status = Status::error(err);
+                vec![]
+            }
+
+            Message::GroupCreated => {
+                self.busy = false;
+                self.group_form = None;
+                self.screen = Screen::Groups;
+                self.status = Status::success("Group created.");
+                vec![Command::LoadGroups { show: true }]
+            }
+            Message::EntryCreated => {
+                self.busy = false;
+                self.entry_form = None;
+                self.screen = Screen::Entries;
+                self.show_expired = false;
+                self.status = Status::success("Entry saved.");
+                vec![Command::LoadPasswords { expired: false }]
+            }
+            Message::WriteFailed(err) => {
                 self.busy = false;
                 self.status = Status::error(err);
                 vec![]
@@ -420,6 +587,8 @@ impl App {
             Screen::Entries => self.on_key_entries(key),
             Screen::Groups => self.on_key_groups(key),
             Screen::EntryDetail => self.on_key_detail(key),
+            Screen::NewEntry => self.on_key_new_entry(key),
+            Screen::NewGroup => self.on_key_new_group(key),
             Screen::Connecting | Screen::AwaitingApproval => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     self.running = false;
@@ -566,8 +735,9 @@ impl App {
             }
             KeyCode::Char('g') => {
                 self.status = Status::info("Loading groups…");
-                vec![Command::LoadGroups]
+                vec![Command::LoadGroups { show: true }]
             }
+            KeyCode::Char('n') => self.open_new_entry(),
             KeyCode::Char('r') => {
                 let expired = self.show_expired;
                 self.status = Status::info("Refreshing…");
@@ -583,6 +753,12 @@ impl App {
 
     fn on_key_groups(&mut self, key: KeyEvent) -> Vec<Command> {
         match key.code {
+            KeyCode::Char('n') => {
+                self.group_form = Some(GroupForm::blank());
+                self.screen = Screen::NewGroup;
+                self.status = Status::info("New group — Tab to move, Enter to save.");
+                vec![]
+            }
             KeyCode::Esc => {
                 self.screen = Screen::Entries;
                 vec![]
@@ -601,6 +777,7 @@ impl App {
                 self.reveal = !self.reveal;
                 vec![]
             }
+            KeyCode::Char('e') => self.open_renew_entry(),
             KeyCode::Esc => {
                 self.detail = None;
                 self.reveal = false;
@@ -612,6 +789,234 @@ impl App {
                 vec![]
             }
             _ => vec![],
+        }
+    }
+
+    /// Open a blank new-entry form. Requires at least one group to file under.
+    fn open_new_entry(&mut self) -> Vec<Command> {
+        if self.groups.is_empty() {
+            self.status = Status::warning(
+                "No groups yet — press g, then n, to create one first (entries need a group).",
+            );
+            return vec![];
+        }
+        self.entry_form = Some(EntryForm::blank(0));
+        self.screen = Screen::NewEntry;
+        self.status = Status::info("New entry — Tab to move, Ctrl+G to generate a password.");
+        vec![]
+    }
+
+    /// Open the new-entry form pre-filled from the entry on the detail screen.
+    /// Saving creates a *new* entry (renew); the old one persists (no update API).
+    fn open_renew_entry(&mut self) -> Vec<Command> {
+        if self.groups.is_empty() {
+            self.status = Status::warning("No groups loaded — press g to load groups, then retry.");
+            return vec![];
+        }
+        let Some(detail) = &self.detail else {
+            return vec![];
+        };
+        // Match the entry's group by name; fall back to the first group.
+        let group_idx = detail
+            .group
+            .as_ref()
+            .and_then(|name| self.groups.iter().position(|g| &g.name == name))
+            .unwrap_or(0);
+        let valid_days = if (MIN_VALID_DAYS..=MAX_VALID_DAYS).contains(&detail.valid_since_days) {
+            detail.valid_since_days
+        } else {
+            DEFAULT_VALID_DAYS
+        };
+        let s = &detail.secret;
+        self.entry_form = Some(EntryForm {
+            name: detail.name.clone().unwrap_or_default(),
+            username: s.username.clone(),
+            password: s.password.clone(),
+            url: s.url.clone(),
+            notes: s.notes.clone(),
+            valid_days: valid_days.to_string(),
+            group_idx,
+            field: EntryField::Password,
+            renewing: true,
+        });
+        self.screen = Screen::NewEntry;
+        self.status =
+            Status::info("Renew — saving creates a new entry; the old one remains until expiry.");
+        vec![]
+    }
+
+    fn on_key_new_entry(&mut self, key: KeyEvent) -> Vec<Command> {
+        if self.busy {
+            return vec![];
+        }
+        // Ctrl+G generates a strong password regardless of the focused field.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
+            if let Some(form) = &mut self.entry_form {
+                form.password.zeroize();
+                form.password = crypto::generate_password(GENERATED_PASSWORD_LEN);
+                form.field = EntryField::Password;
+            }
+            self.status = Status::info("Generated a random password.");
+            return vec![];
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.entry_form = None;
+                self.screen = Screen::Entries;
+                vec![]
+            }
+            KeyCode::Enter => self.submit_new_entry(),
+            KeyCode::Tab | KeyCode::Down => {
+                if let Some(form) = &mut self.entry_form {
+                    form.field = form.field.next();
+                }
+                vec![]
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                if let Some(form) = &mut self.entry_form {
+                    form.field = form.field.prev();
+                }
+                vec![]
+            }
+            KeyCode::Left => {
+                let count = self.groups.len();
+                if let Some(form) = &mut self.entry_form {
+                    if form.field == EntryField::Group && count > 0 {
+                        form.group_idx = (form.group_idx + count - 1) % count;
+                    }
+                }
+                vec![]
+            }
+            KeyCode::Right => {
+                let count = self.groups.len();
+                if let Some(form) = &mut self.entry_form {
+                    if form.field == EntryField::Group && count > 0 {
+                        form.group_idx = (form.group_idx + 1) % count;
+                    }
+                }
+                vec![]
+            }
+            KeyCode::Backspace => {
+                if let Some(form) = &mut self.entry_form {
+                    if let Some(field) = form.focused_mut() {
+                        field.pop();
+                    }
+                }
+                vec![]
+            }
+            KeyCode::Char(c) => {
+                if let Some(form) = &mut self.entry_form {
+                    match form.field {
+                        // Group is chosen with ←/→; valid-days takes digits only.
+                        EntryField::Group => {}
+                        EntryField::ValidDays if !c.is_ascii_digit() => {}
+                        _ => {
+                            if let Some(field) = form.focused_mut() {
+                                field.push(c);
+                            }
+                        }
+                    }
+                }
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Validate the new-entry form and, if sound, emit the create command.
+    fn submit_new_entry(&mut self) -> Vec<Command> {
+        let outcome = {
+            let Some(form) = self.entry_form.as_ref() else {
+                return vec![];
+            };
+            validate_entry_form(form, &self.groups)
+        };
+        match outcome {
+            Err(status) => {
+                self.status = status;
+                vec![]
+            }
+            Ok((secret, group_id, name, valid_since_days)) => {
+                self.busy = true;
+                self.status = Status::info("Saving entry…");
+                vec![Command::CreateEntry {
+                    secret,
+                    group_id,
+                    name,
+                    valid_since_days,
+                }]
+            }
+        }
+    }
+
+    fn on_key_new_group(&mut self, key: KeyEvent) -> Vec<Command> {
+        if self.busy {
+            return vec![];
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.group_form = None;
+                self.screen = Screen::Groups;
+                vec![]
+            }
+            KeyCode::Enter => self.submit_new_group(),
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                if let Some(form) = &mut self.group_form {
+                    form.field = match form.field {
+                        GroupField::Name => GroupField::Extra,
+                        GroupField::Extra => GroupField::Name,
+                    };
+                }
+                vec![]
+            }
+            KeyCode::Backspace => {
+                if let Some(form) = &mut self.group_form {
+                    form.focused_mut().pop();
+                }
+                vec![]
+            }
+            KeyCode::Char(c) => {
+                if let Some(form) = &mut self.group_form {
+                    form.focused_mut().push(c);
+                }
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Validate the new-group form and, if sound, emit the create command.
+    fn submit_new_group(&mut self) -> Vec<Command> {
+        let outcome = {
+            let Some(form) = self.group_form.as_ref() else {
+                return vec![];
+            };
+            let name = form.name.trim();
+            if name.is_empty() {
+                Err(Status::warning("Group name can't be empty."))
+            } else if name.chars().count() > MAX_GROUP_NAME_LEN {
+                Err(Status::warning(format!(
+                    "Group name must be ≤{MAX_GROUP_NAME_LEN} characters."
+                )))
+            } else {
+                let extra = if form.extra.trim().is_empty() {
+                    None
+                } else {
+                    Some(form.extra.clone())
+                };
+                Ok((name.to_string(), extra))
+            }
+        };
+        match outcome {
+            Err(status) => {
+                self.status = status;
+                vec![]
+            }
+            Ok((name, extra)) => {
+                self.busy = true;
+                self.status = Status::info("Creating group…");
+                vec![Command::CreateGroup { name, extra }]
+            }
         }
     }
 
@@ -705,21 +1110,23 @@ impl App {
                     let _ = tx.send(msg);
                 });
             }
-            Command::LoadGroups => {
+            Command::LoadGroups { show } => {
                 let Some((token, _key)) = self.session_credentials() else {
                     return;
                 };
                 self.runtime.spawn(async move {
                     let msg = match vault::list_groups(&client, &token).await {
-                        Ok(groups) => Message::GroupsLoaded(
-                            groups
+                        Ok(groups) => Message::GroupsLoaded {
+                            rows: groups
                                 .into_iter()
                                 .map(|g| GroupRow {
+                                    uuid: g.uuid,
                                     name: g.name,
                                     extra: g.extra,
                                 })
                                 .collect(),
-                        ),
+                            show,
+                        },
                         Err(e) => Message::VaultFailed(vault_error("load groups", &e)),
                     };
                     let _ = tx.send(msg);
@@ -742,6 +1149,49 @@ impl App {
                     let _ = tx.send(msg);
                 });
             }
+            Command::CreateGroup { name, extra } => {
+                let Some((token, _key)) = self.session_credentials() else {
+                    return;
+                };
+                self.runtime.spawn(async move {
+                    let msg =
+                        match vault::create_group(&client, &token, &name, extra.as_deref()).await {
+                            Ok(_) => Message::GroupCreated,
+                            Err(e) => Message::WriteFailed(vault_error("create group", &e)),
+                        };
+                    let _ = tx.send(msg);
+                });
+            }
+            Command::CreateEntry {
+                secret,
+                group_id,
+                name,
+                valid_since_days,
+            } => {
+                let Some((token, key)) = self.session_credentials() else {
+                    return;
+                };
+                self.runtime.spawn(async move {
+                    // `secret` is dropped (zeroized) when this task ends.
+                    let msg = match secret.seal(&key) {
+                        Ok(pwd) => {
+                            let req = PwdCreateRequest {
+                                pwd,
+                                group_id,
+                                name,
+                                extra: None,
+                                valid_since_days: Some(valid_since_days),
+                            };
+                            match vault::create_password(&client, &token, &req).await {
+                                Ok(_) => Message::EntryCreated,
+                                Err(e) => Message::WriteFailed(vault_error("create entry", &e)),
+                            }
+                        }
+                        Err(e) => Message::WriteFailed(format!("Couldn't encrypt entry: {e}")),
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
         }
     }
 
@@ -751,6 +1201,57 @@ impl App {
             .as_ref()
             .map(|state| (state.device_token.clone(), state.shared_key()))
     }
+}
+
+/// Validate a [`EntryForm`] against the loaded groups. On success returns the data
+/// needed to build a [`Command::CreateEntry`]; on failure, the [`Status`] to show.
+fn validate_entry_form(
+    form: &EntryForm,
+    groups: &[GroupRow],
+) -> Result<(PwdSecret, String, Option<String>, i64), Status> {
+    if groups.is_empty() {
+        return Err(Status::warning(
+            "No group to file this under — create a group first.",
+        ));
+    }
+    if form.password.is_empty() {
+        return Err(Status::warning(
+            "Password can't be empty (press Ctrl+G to generate one).",
+        ));
+    }
+    if form.name.chars().count() > MAX_ENTRY_NAME_LEN {
+        return Err(Status::warning(format!(
+            "Name must be ≤{MAX_ENTRY_NAME_LEN} characters."
+        )));
+    }
+    let valid_since_days = if form.valid_days.trim().is_empty() {
+        DEFAULT_VALID_DAYS
+    } else {
+        match form.valid_days.trim().parse::<i64>() {
+            Ok(d) if (MIN_VALID_DAYS..=MAX_VALID_DAYS).contains(&d) => d,
+            _ => {
+                return Err(Status::warning(format!(
+                    "Valid days must be a number from {MIN_VALID_DAYS} to {MAX_VALID_DAYS}."
+                )))
+            }
+        }
+    };
+    let group_id = match groups.get(form.group_idx) {
+        Some(g) => g.uuid.clone(),
+        None => return Err(Status::error("Selected group is no longer available.")),
+    };
+    let name = if form.name.trim().is_empty() {
+        None
+    } else {
+        Some(form.name.clone())
+    };
+    let secret = PwdSecret {
+        username: form.username.clone(),
+        password: form.password.clone(),
+        url: form.url.clone(),
+        notes: form.notes.clone(),
+    };
+    Ok((secret, group_id, name, valid_since_days))
 }
 
 /// Build a display-ready error string for a failed vault read, turning the generic
@@ -930,7 +1431,10 @@ mod tests {
         assert!(app.verified);
         assert!(matches!(
             cmds.as_slice(),
-            [Command::LoadPasswords { expired: false }]
+            [
+                Command::LoadPasswords { expired: false },
+                Command::LoadGroups { show: false }
+            ]
         ));
     }
 
@@ -1014,7 +1518,10 @@ mod tests {
             KeyCode::Char('g'),
             KeyModifiers::NONE,
         )));
-        assert!(matches!(cmds.as_slice(), [Command::LoadGroups]));
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::LoadGroups { show: true }]
+        ));
     }
 
     #[test]
@@ -1096,5 +1603,239 @@ mod tests {
         let cmds = app.update(Message::ReSigned);
         assert_eq!(app.screen, Screen::AwaitingApproval);
         assert!(matches!(cmds.as_slice(), [Command::Verify { .. }]));
+    }
+
+    // ---- M5: write ----
+
+    fn group_rows(specs: &[(&str, &str)]) -> Vec<GroupRow> {
+        specs
+            .iter()
+            .map(|(uuid, name)| GroupRow {
+                uuid: (*uuid).into(),
+                name: (*name).into(),
+                extra: None,
+            })
+            .collect()
+    }
+
+    fn press_ctrl(app: &mut App, code: KeyCode) {
+        app.handle(Message::Key(KeyEvent::new(code, KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn entries_n_without_groups_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::Entries;
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+        )));
+        assert!(cmds.is_empty());
+        assert_eq!(app.screen, Screen::Entries);
+        assert_eq!(app.status.kind, StatusKind::Warning);
+        assert!(app.entry_form.is_none());
+    }
+
+    #[test]
+    fn entries_n_with_groups_opens_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::Entries;
+        app.groups = group_rows(&[("g1", "Work")]);
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.screen, Screen::NewEntry);
+        assert!(app.entry_form.is_some());
+    }
+
+    #[test]
+    fn new_entry_ctrl_g_generates_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.entry_form = Some(EntryForm::blank(0));
+        press_ctrl(&mut app, KeyCode::Char('g'));
+        let form = app.entry_form.as_ref().unwrap();
+        assert_eq!(form.password.chars().count(), GENERATED_PASSWORD_LEN);
+        assert_eq!(form.field, EntryField::Password);
+    }
+
+    #[test]
+    fn new_entry_group_picker_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.groups = group_rows(&[("g1", "Work"), ("g2", "Home")]);
+        let mut form = EntryForm::blank(0);
+        form.field = EntryField::Group;
+        app.entry_form = Some(form);
+
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.entry_form.as_ref().unwrap().group_idx, 1);
+        press(&mut app, KeyCode::Right); // wraps back to 0
+        assert_eq!(app.entry_form.as_ref().unwrap().group_idx, 0);
+    }
+
+    #[test]
+    fn new_entry_submit_emits_create_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.groups = group_rows(&[("g1", "Work")]);
+        let mut form = EntryForm::blank(0);
+        form.password = "s3cr3t".into();
+        form.username = "alice".into();
+        app.entry_form = Some(form);
+
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::CreateEntry { group_id, secret, valid_since_days, .. }]
+                if group_id == "g1" && secret.password == "s3cr3t" && *valid_since_days == 30
+        ));
+        assert!(app.busy);
+    }
+
+    #[test]
+    fn new_entry_empty_password_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.groups = group_rows(&[("g1", "Work")]);
+        app.entry_form = Some(EntryForm::blank(0)); // password empty
+
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(cmds.is_empty());
+        assert_eq!(app.status.kind, StatusKind::Warning);
+    }
+
+    #[test]
+    fn new_entry_invalid_valid_days_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.groups = group_rows(&[("g1", "Work")]);
+        let mut form = EntryForm::blank(0);
+        form.password = "x".into();
+        form.valid_days = "999".into(); // > MAX_VALID_DAYS
+        app.entry_form = Some(form);
+
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(cmds.is_empty());
+        assert_eq!(app.status.kind, StatusKind::Warning);
+    }
+
+    #[test]
+    fn detail_e_opens_prefilled_renew() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::EntryDetail;
+        app.groups = group_rows(&[("g1", "Work"), ("g2", "Home")]);
+        app.detail = Some(DetailView {
+            name: Some("GitHub".into()),
+            group: Some("Home".into()),
+            expires: 5,
+            valid_since_days: 60,
+            created_at: "2026-06-01".into(),
+            secret: PwdSecret {
+                username: "alice".into(),
+                password: "old-pw".into(),
+                url: "https://github.com".into(),
+                notes: String::new(),
+            },
+        });
+
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(app.screen, Screen::NewEntry);
+        let form = app.entry_form.as_ref().unwrap();
+        assert!(form.renewing);
+        assert_eq!(form.password, "old-pw");
+        assert_eq!(form.group_idx, 1); // matched "Home"
+        assert_eq!(form.valid_days, "60");
+    }
+
+    #[test]
+    fn groups_n_opens_group_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::Groups;
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.screen, Screen::NewGroup);
+        assert!(app.group_form.is_some());
+    }
+
+    #[test]
+    fn new_group_submit_emits_create_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewGroup;
+        let mut form = GroupForm::blank();
+        form.name = "Personal".into();
+        app.group_form = Some(form);
+
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::CreateGroup { name, extra: None }] if name == "Personal"
+        ));
+        assert!(app.busy);
+    }
+
+    #[test]
+    fn new_group_empty_name_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewGroup;
+        app.group_form = Some(GroupForm::blank());
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(cmds.is_empty());
+        assert_eq!(app.status.kind, StatusKind::Warning);
+    }
+
+    #[test]
+    fn group_created_reloads_and_returns_to_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewGroup;
+        app.group_form = Some(GroupForm::blank());
+        let cmds = app.update(Message::GroupCreated);
+        assert_eq!(app.screen, Screen::Groups);
+        assert!(app.group_form.is_none());
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::LoadGroups { show: true }]
+        ));
+    }
+
+    #[test]
+    fn entry_created_reloads_valid_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.show_expired = true;
+        app.entry_form = Some(EntryForm::blank(0));
+        let cmds = app.update(Message::EntryCreated);
+        assert_eq!(app.screen, Screen::Entries);
+        assert!(app.entry_form.is_none());
+        assert!(!app.show_expired);
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::LoadPasswords { expired: false }]
+        ));
     }
 }

@@ -13,6 +13,7 @@
 use ratatui::crossterm::event::KeyEvent;
 
 use crate::app::{DetailView, EntryRow, GroupRow};
+use crate::secret::PwdSecret;
 use crate::store::StoreState;
 
 /// An input event or the outcome of a [`Command`].
@@ -44,12 +45,19 @@ pub enum Message {
 
     /// Password list loaded and each row decrypted to its display label.
     PasswordsLoaded { expired: bool, rows: Vec<EntryRow> },
-    /// Group list loaded.
-    GroupsLoaded(Vec<GroupRow>),
+    /// Group list loaded; `show` requests switching to the Groups screen.
+    GroupsLoaded { rows: Vec<GroupRow>, show: bool },
     /// A single entry was fetched and decrypted.
     EntryLoaded(Box<DetailView>),
     /// A vault read failed (network, auth, or decryption); message is display-ready.
     VaultFailed(String),
+
+    /// A group was created.
+    GroupCreated,
+    /// An entry was created (or renewed — a renew is just a new create).
+    EntryCreated,
+    /// A vault write (create group/entry) failed; message is display-ready.
+    WriteFailed(String),
 }
 
 /// Async work requested by `App::update`, executed on the tokio runtime.
@@ -66,8 +74,18 @@ pub enum Command {
     ReSign,
     /// Fetch + decrypt the valid or expired password list.
     LoadPasswords { expired: bool },
-    /// Fetch the group list.
-    LoadGroups,
+    /// Fetch the group list. `show` opens the Groups screen; when false the list is
+    /// just refreshed in the background (e.g. to populate the new-entry group picker).
+    LoadGroups { show: bool },
     /// Fetch + decrypt a single entry by uuid.
     LoadEntry { uuid: String },
+    /// Create a new group.
+    CreateGroup { name: String, extra: Option<String> },
+    /// Seal `secret` and create a new entry in `group_id` (also used for renew).
+    CreateEntry {
+        secret: PwdSecret,
+        group_id: String,
+        name: Option<String>,
+        valid_since_days: i64,
+    },
 }
