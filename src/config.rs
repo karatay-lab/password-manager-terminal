@@ -1,9 +1,66 @@
 use std::env;
+use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::str::FromStr;
+
+/// Application identifier used for per-user / system config subdirectories.
+pub const APP_DIR: &str = "pwd-manager-terminal";
+
+/// Load `.env` layers into the process environment before [`Config::from_env`].
+///
+/// Sources are tried lowest-priority *last*: `dotenvy` never overrides a variable
+/// that is already set, so the effective precedence is
+/// `real environment > ./.env > user config > system config`. Missing files are
+/// ignored. This lets a globally installed binary (e.g. from the `.deb`/`.msi`) pick
+/// up config from a standard location instead of only the launch directory.
+pub fn load_env_files() {
+    // 1. Current directory (and parents) — the dev / local override.
+    let _ = dotenvy::dotenv();
+
+    // 2. Per-user config: $XDG_CONFIG_HOME or ~/.config (Unix), %APPDATA% (Windows).
+    if let Some(dir) = user_config_dir() {
+        let _ = dotenvy::from_path(dir.join(APP_DIR).join(".env"));
+    }
+
+    // 3. System-wide config (Unix); a harmless missing-file no-op elsewhere.
+    let _ = dotenvy::from_path(format!("/etc/{APP_DIR}/.env"));
+}
+
+/// Base directory for per-user config, resolved from the real environment.
+fn user_config_dir() -> Option<PathBuf> {
+    config_dir_from(
+        env::var_os("XDG_CONFIG_HOME"),
+        env::var_os("HOME"),
+        env::var_os("APPDATA"),
+    )
+}
+
+/// Pure resolver for [`user_config_dir`] (kept env-free so it is unit-testable):
+/// `$XDG_CONFIG_HOME`, else `$HOME/.config`, else Windows `%APPDATA%`.
+fn config_dir_from(
+    xdg: Option<impl AsRef<OsStr>>,
+    home: Option<impl AsRef<OsStr>>,
+    appdata: Option<impl AsRef<OsStr>>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg {
+        if !xdg.as_ref().is_empty() {
+            return Some(PathBuf::from(xdg.as_ref()));
+        }
+    }
+    if let Some(home) = home {
+        if !home.as_ref().is_empty() {
+            return Some(PathBuf::from(home.as_ref()).join(".config"));
+        }
+    }
+    appdata
+        .filter(|a| !a.as_ref().is_empty())
+        .map(|a| PathBuf::from(a.as_ref()))
+}
 
 /// Runtime configuration, sourced from the environment (`.env`) with sane defaults.
 ///
-/// Precedence for v1 is env > defaults; CLI/file layers come later (see plan §7).
+/// Precedence is `env > defaults`; the `.env` layers are merged into the environment
+/// by [`load_env_files`] at startup.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Backend API base URL, no trailing slash.
@@ -40,4 +97,34 @@ fn parse_env<T: FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolve(xdg: Option<&str>, home: Option<&str>, appdata: Option<&str>) -> Option<PathBuf> {
+        config_dir_from(xdg, home, appdata)
+    }
+
+    #[test]
+    fn config_dir_prefers_xdg_then_home_then_appdata() {
+        // XDG wins outright.
+        assert_eq!(
+            resolve(Some("/x/cfg"), Some("/home/a"), Some("C:\\AppData")),
+            Some(PathBuf::from("/x/cfg"))
+        );
+        // Empty XDG falls through to HOME/.config.
+        assert_eq!(
+            resolve(Some(""), Some("/home/a"), None),
+            Some(PathBuf::from("/home/a/.config"))
+        );
+        // No XDG/HOME falls back to %APPDATA% (Windows).
+        assert_eq!(
+            resolve(None, None, Some("C:\\Users\\a\\AppData\\Roaming")),
+            Some(PathBuf::from("C:\\Users\\a\\AppData\\Roaming"))
+        );
+        // Nothing set → no config dir.
+        assert_eq!(resolve(None, None, None), None);
+    }
 }
