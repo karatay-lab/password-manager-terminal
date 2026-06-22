@@ -16,3 +16,6 @@ Cargo.lock.orig
 .vscode/
 *.swp
 .DS_Store
+
+# Claude Code session transcript dumps (date-prefixed .txt at repo root)
+/20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.txt
