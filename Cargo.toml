@@ -1,6 +1,6 @@
 [package]
 name = "pwd-manager-terminal"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Berkay Karatay <karatay.berkay@gmail.com>"]
 description = "Terminal password manager — a ratatui TUI client"
