@@ -16,21 +16,22 @@ platform, in which case build from source.
 ### Packaged installer (recommended — no toolchain)
 
 Download the latest `.deb` or `.msi` from the
-[**Releases**](https://github.com/karatay-lab/password-manager-terminal/releases) page:
+[**latest release**](https://github.com/karatay-lab/password-manager-terminal/releases/latest):
 
-- **Linux (Debian/Ubuntu & derivatives):**
+- **Linux (Debian/Ubuntu & derivatives):** grab the `.deb`, then from your download
+  directory (the `*` matches whichever version you downloaded):
 
   ```sh
-  sudo apt install ./pwd-manager-terminal_<version>-1_amd64.deb   # resolves deps
-  # or: sudo dpkg -i pwd-manager-terminal_<version>-1_amd64.deb
+  sudo apt install ./pwd-manager-terminal_*_amd64.deb   # resolves deps
+  # or: sudo dpkg -i ./pwd-manager-terminal_*_amd64.deb
   ```
 
   Installs `pwd-manager-terminal` to `/usr/bin` (already on `PATH`); a sample config
   lands at `/usr/share/doc/pwd-manager-terminal/env.example`.
 
-- **Windows:** run `pwd-manager-terminal-<version>-x86_64.msi` and follow the wizard.
-  It installs into *Program Files* and offers to add itself to `PATH`. Uninstall via
-  *Settings → Apps → Installed apps*.
+- **Windows:** download and run the `.msi` (`pwd-manager-terminal-*-x86_64.msi`), then
+  follow the wizard. It installs into *Program Files* and offers to add itself to
+  `PATH`. Uninstall via *Settings → Apps → Installed apps*.
 
 Then [configure](#configure) and run `pwd-manager-terminal`.
 
