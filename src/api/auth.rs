@@ -1,15 +1,18 @@
-//! Enrollment + session-check endpoints: `/greet`, `/register`, `/verify`.
+//! Enrollment + session-check endpoints: `/greet`, `/sign-up`, `/sign-in`, `/verify`.
 //!
-//! Flow (see `docs/protocol-notes.md` §Endpoints and `v1/plan.md` §4):
+//! Flow (see `docs/protocol-notes.md` §Endpoints and the backend's `CLIENT.md`):
 //! 1. [`greet`] sends our public key, returns the server's public key.
-//! 2. The caller derives the shared key and seals the token + ehlo.
-//! 3. [`register`] submits the sealed credentials (`is_confirmed=false` after).
+//! 2. The caller derives the shared key and seals the user name + ehlo.
+//! 3. [`sign_up`] (new account) or [`sign_in`] (existing account) submits the
+//!    sealed credentials and returns the server-issued device token to persist
+//!    (`is_confirmed=false` after — admin approval pending).
 //! 4. [`verify`] polls until an admin approves (401 → not yet; 200 → approved).
 
 use super::client::{check_status, ApiClient, DEVICE_TOKEN_HEADER};
 use super::error::ApiError;
 use super::models::{
-    GreetRequest, GreetResponse, ReSignRequest, RefreshRequest, RefreshResponse, RegisterRequest,
+    GreetRequest, GreetResponse, ReSignRequest, RefreshRequest, RefreshResponse, SignRequest,
+    SignResponse,
 };
 
 /// `POST /greet` — send our X25519 public key, return the server's public key.
@@ -30,27 +33,57 @@ pub async fn greet(client: &ApiClient, client_public: &[u8; 32]) -> Result<[u8; 
     decode_public_key(&parsed.server_public_key)
 }
 
-/// `POST /register` — submit the sealed device token and ehlo secret.
+/// `POST /sign-up` — create a new account from the sealed name + ehlo and link
+/// this device to it, returning the server-issued device token.
 ///
-/// On success the identity exists but is unconfirmed; nothing else works until an
-/// admin approves it (poll with [`verify`]). Both args are `hex(seal(..))`.
-pub async fn register(
+/// Returns [`ApiError::Conflict`] (409) if the name is already taken — the caller
+/// should fall back to [`sign_in`] or pick another name. On success the device
+/// exists but is unconfirmed; poll [`verify`] until an admin approves it. Both
+/// args are `hex(seal(..))`.
+pub async fn sign_up(
     client: &ApiClient,
-    sealed_token_hex: &str,
+    sealed_name_hex: &str,
     sealed_ehlo_hex: &str,
-) -> Result<(), ApiError> {
-    let body = RegisterRequest {
-        token: sealed_token_hex.to_string(),
+) -> Result<String, ApiError> {
+    sign(client, "/sign-up", sealed_name_hex, sealed_ehlo_hex).await
+}
+
+/// `POST /sign-in` — link this device to an existing account by sealed name +
+/// ehlo, returning the server-issued device token.
+///
+/// Returns [`ApiError::Unauthorized`] (401) for an unknown name, a wrong ehlo, or
+/// a soft-deleted account (deliberately indistinguishable). On success the device
+/// exists but is unconfirmed; poll [`verify`] until an admin approves it. Both
+/// args are `hex(seal(..))`.
+pub async fn sign_in(
+    client: &ApiClient,
+    sealed_name_hex: &str,
+    sealed_ehlo_hex: &str,
+) -> Result<String, ApiError> {
+    sign(client, "/sign-in", sealed_name_hex, sealed_ehlo_hex).await
+}
+
+/// Shared body for [`sign_up`]/[`sign_in`] — identical payload + response, only
+/// the path and the meaning of a non-2xx status differ (handled by the callers).
+async fn sign(
+    client: &ApiClient,
+    path: &str,
+    sealed_name_hex: &str,
+    sealed_ehlo_hex: &str,
+) -> Result<String, ApiError> {
+    let body = SignRequest {
+        name: sealed_name_hex.to_string(),
         ehlo: sealed_ehlo_hex.to_string(),
     };
     let resp = client
         .http()
-        .post(client.url("/register"))
+        .post(client.url(path))
         .json(&body)
         .send()
         .await?;
-    check_status(resp).await?;
-    Ok(())
+    let resp = check_status(resp).await?;
+    let parsed: SignResponse = resp.json().await?;
+    Ok(parsed.token)
 }
 
 /// `GET /verify` — check whether the device token is currently authorized.

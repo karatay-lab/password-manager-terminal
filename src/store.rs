@@ -32,7 +32,10 @@ use crate::crypto::{self, CryptoError};
 /// Magic bytes identifying our store file format.
 const MAGIC: &[u8; 4] = b"PWMS";
 /// On-disk format version (bump when the layout changes).
-const VERSION: u8 = 1;
+///
+/// v2 added `user_name` to [`StoreState`] for the user sign-up/sign-in model; a v1
+/// store (from the old `/register` flow) is rejected as unsupported → re-enroll.
+const VERSION: u8 = 2;
 /// Argon2 salt length in bytes.
 const SALT_LEN: usize = 16;
 /// File name within the data directory.
@@ -51,9 +54,13 @@ pub struct StoreState {
     pub client_public: [u8; 32],
     /// Server's X25519 public key, from the `/greet` response.
     pub server_public: [u8; 32],
-    /// Raw device token, sent in the `device-token` header.
+    /// The account handle (user name) used at `/sign-up` / `/sign-in`.
+    pub user_name: String,
+    /// Raw device token, server-issued at `/sign-up` / `/sign-in` (and rotated by
+    /// `/refresh`), sent in the `device-token` header.
     pub device_token: String,
-    /// Ehlo secret chosen at register; needed for `/re-sign` and `/refresh`.
+    /// The user's ehlo secret, chosen at sign-up; needed for `/re-sign` and
+    /// `/refresh` and to re-`/sign-in` a new device for the same account.
     pub ehlo_secret: String,
 }
 
@@ -240,6 +247,7 @@ mod tests {
             client_private: [1u8; 32],
             client_public: [2u8; 32],
             server_public: [3u8; 32],
+            user_name: "alice".into(),
             device_token: "device-token-001".into(),
             ehlo_secret: "ehlo-secret-xyz".into(),
         }
@@ -249,6 +257,7 @@ mod tests {
         assert_eq!(a.client_private, b.client_private);
         assert_eq!(a.client_public, b.client_public);
         assert_eq!(a.server_public, b.server_public);
+        assert_eq!(a.user_name, b.user_name);
         assert_eq!(a.device_token, b.device_token);
         assert_eq!(a.ehlo_secret, b.ehlo_secret);
     }

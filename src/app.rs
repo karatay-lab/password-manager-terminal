@@ -7,8 +7,9 @@
 //! commands to run, which makes the state machine unit-testable without a backend.
 //!
 //! Flows (plan §8):
-//! - **Enroll** (no local store): set a master passphrase → greet/register → poll
-//!   `/verify` on the *awaiting-approval* screen until an admin approves.
+//! - **Enroll** (no local store): enter account name + ehlo + master passphrase →
+//!   greet → `/sign-up` or `/sign-in` → poll `/verify` on the *awaiting-approval*
+//!   screen until an admin approves.
 //! - **Unlock** (store exists): passphrase → decrypt → `/verify`; on 401 offer
 //!   `/re-sign` (re-binds the IP, but needs admin re-approval).
 
@@ -21,7 +22,7 @@ use ratatui::DefaultTerminal;
 use tokio::runtime::Runtime;
 use zeroize::Zeroize;
 
-use crate::api::models::{PwdCreateRequest, PwdDetail, PwdListItem};
+use crate::api::models::{PwdCreateRequest, PwdDetail, PwdListItem, PwdUpdateRequest};
 use crate::api::{auth, vault, ApiClient, ApiError};
 use crate::clipboard::Clipboard;
 use crate::config::Config;
@@ -38,8 +39,11 @@ const POLL_INTERVAL_MS: u64 = 3000;
 const EVENT_TICK: Duration = Duration::from_millis(100);
 /// Minimum master-passphrase length accepted at enrollment.
 const MIN_PASSPHRASE_LEN: usize = 8;
-/// Length of a password produced by the in-form generator.
-const GENERATED_PASSWORD_LEN: usize = 20;
+/// Preset lengths offered by the Ctrl+G password-length picker.
+pub const PWD_GEN_PRESETS: [usize; 4] = [24, 32, 64, 128];
+/// Bounds accepted for a custom generated-password length.
+const MIN_PASSWORD_LEN: usize = 8;
+const MAX_PASSWORD_LEN: usize = 256;
 /// Default expiry window for a new entry when the field is left blank.
 const DEFAULT_VALID_DAYS: i64 = 30;
 /// Server-enforced bounds for `valid_since_days`.
@@ -49,6 +53,10 @@ const MAX_VALID_DAYS: i64 = 365;
 const MAX_GROUP_NAME_LEN: usize = 128;
 /// Server-enforced max entry-name length.
 const MAX_ENTRY_NAME_LEN: usize = 256;
+/// Server-enforced max account-name length (`/sign-up`, `/sign-in`).
+const MAX_NAME_LEN: usize = 64;
+/// Minimum ehlo-secret length required when creating a new account.
+const MIN_EHLO_LEN: usize = 8;
 
 /// Which screen is currently shown (and therefore how input is interpreted).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,7 +67,7 @@ pub enum Screen {
     Enroll,
     /// A blocking step is in flight after unlock (verifying with the server).
     Connecting,
-    /// Registered/re-signed but unconfirmed: polling `/verify` for approval.
+    /// Enrolled/re-signed but unconfirmed: polling `/verify` for approval.
     AwaitingApproval,
     /// `/verify` returned 401 after unlock — offer re-sign or keep waiting.
     ReSignPrompt,
@@ -77,11 +85,54 @@ pub enum Screen {
     NewGroup,
 }
 
-/// Which field the enroll form's cursor is on.
+/// Whether first-run enrollment creates a new account or signs in to an existing
+/// one. Both share the same crypto path; only the endpoint (and 409 handling)
+/// differ (see [`enroll`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SignMode {
+    /// `POST /sign-up` — create a new account (name must be free).
+    SignUp,
+    /// `POST /sign-in` — link this device to an existing account.
+    SignIn,
+}
+
+impl SignMode {
+    /// The other mode (toggled on the enroll screen with Ctrl+T).
+    fn toggled(self) -> Self {
+        match self {
+            SignMode::SignUp => SignMode::SignIn,
+            SignMode::SignIn => SignMode::SignUp,
+        }
+    }
+}
+
+/// Which field the enroll form's cursor is on (in tab order).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EnrollField {
+    Name,
+    Ehlo,
     Passphrase,
     Confirm,
+}
+
+impl EnrollField {
+    /// Fields in tab order.
+    const ORDER: [EnrollField; 4] = [
+        EnrollField::Name,
+        EnrollField::Ehlo,
+        EnrollField::Passphrase,
+        EnrollField::Confirm,
+    ];
+
+    fn next(self) -> Self {
+        let i = Self::ORDER.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ORDER[(i + 1) % Self::ORDER.len()]
+    }
+
+    fn prev(self) -> Self {
+        let i = Self::ORDER.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ORDER[(i + Self::ORDER.len() - 1) % Self::ORDER.len()]
+    }
 }
 
 /// Which field the new-entry form's cursor is on (in tab order).
@@ -126,14 +177,22 @@ pub enum GroupField {
     Extra,
 }
 
-/// A decrypted row shown in the entries list. Carries only the label fields
-/// (username/url) — the password from the list blob is dropped after decoding.
+/// A decrypted row shown in the entries list. Carries the label fields
+/// (username/url) plus a short masked password preview and timestamps for the
+/// list columns; the full password from the list blob is dropped after decoding.
 pub struct EntryRow {
     pub uuid: String,
     pub username: String,
     pub url: String,
+    /// First few chars of the password followed by `****` (a deliberate partial
+    /// reveal for the list; the full secret is never kept here).
+    pub pwd_preview: String,
     /// Days until expiry (from the list endpoint); `0` on the expired list.
     pub expires: i64,
+    /// Validity window in days (`valid_since_days` from the list endpoint).
+    pub valid_since_days: i64,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// A group as shown in the groups list. `uuid` is needed to file new entries.
@@ -154,8 +213,9 @@ pub struct EntryForm {
     pub valid_days: String,
     pub group_idx: usize,
     pub field: EntryField,
-    /// True when pre-filled from an existing entry (a renew → fresh create).
-    pub renewing: bool,
+    /// `Some(uuid)` when editing an existing entry (saving updates it in place via
+    /// `PUT /pwd/update`); `None` for a brand-new entry (saving creates one).
+    pub edit_uuid: Option<String>,
 }
 
 impl EntryForm {
@@ -169,7 +229,7 @@ impl EntryForm {
             valid_days: DEFAULT_VALID_DAYS.to_string(),
             group_idx,
             field: EntryField::Name,
-            renewing: false,
+            edit_uuid: None,
         }
     }
 
@@ -192,6 +252,64 @@ impl Drop for EntryForm {
         self.password.zeroize();
         self.username.zeroize();
         self.notes.zeroize();
+    }
+}
+
+/// State of the password-length picker overlaid on the entry form when the user
+/// presses Ctrl+G. The cursor moves over the preset lengths plus a final "Custom"
+/// row whose typed digits choose an arbitrary length.
+pub struct PwdGen {
+    /// Cursor over the rows: `0..PWD_GEN_PRESETS.len()` are presets; the last row
+    /// ([`PwdGen::CUSTOM_IDX`]) is the custom-length field.
+    pub idx: usize,
+    /// Digits typed into the custom-length field.
+    pub custom: String,
+}
+
+impl PwdGen {
+    /// Row index of the "Custom" entry (it follows the presets).
+    pub const CUSTOM_IDX: usize = PWD_GEN_PRESETS.len();
+    /// Total number of selectable rows (presets + custom).
+    const ROWS: usize = PWD_GEN_PRESETS.len() + 1;
+
+    fn new() -> Self {
+        Self {
+            idx: 0,
+            custom: String::new(),
+        }
+    }
+
+    /// Open pre-filled on the custom row when a previous custom length is
+    /// remembered, so pressing ↵ reuses it; otherwise start on the first preset.
+    fn with_remembered_custom(custom: Option<String>) -> Self {
+        match custom {
+            Some(c) if !c.is_empty() => Self {
+                idx: Self::CUSTOM_IDX,
+                custom: c,
+            },
+            _ => Self::new(),
+        }
+    }
+
+    fn next(&mut self) {
+        self.idx = (self.idx + 1) % Self::ROWS;
+    }
+
+    fn prev(&mut self) {
+        self.idx = (self.idx + Self::ROWS - 1) % Self::ROWS;
+    }
+
+    /// The length to generate, or `None` when the custom row is selected but its
+    /// value is empty or outside [`MIN_PASSWORD_LEN`, `MAX_PASSWORD_LEN`].
+    fn selected_len(&self) -> Option<usize> {
+        if self.idx == Self::CUSTOM_IDX {
+            let n: usize = self.custom.parse().ok()?;
+            (MIN_PASSWORD_LEN..=MAX_PASSWORD_LEN)
+                .contains(&n)
+                .then_some(n)
+        } else {
+            Some(PWD_GEN_PRESETS[self.idx])
+        }
     }
 }
 
@@ -221,22 +339,27 @@ impl GroupForm {
 
 /// A fully decrypted entry for the detail screen. `secret` zeroizes on drop.
 pub struct DetailView {
+    /// The entry's server uuid — needed to edit it in place (`PUT /pwd/update`).
+    pub uuid: String,
     pub name: Option<String>,
     pub group: Option<String>,
     pub expires: i64,
     pub valid_since_days: i64,
     pub created_at: String,
+    pub updated_at: String,
     pub secret: PwdSecret,
 }
 
 impl DetailView {
     fn from_response(resp: PwdDetail, secret: PwdSecret) -> Self {
         Self {
+            uuid: resp.uuid,
             name: resp.name,
             group: resp.group.map(|g| g.name),
             expires: resp.expires,
             valid_since_days: resp.valid_since_days,
             created_at: resp.created_at,
+            updated_at: resp.updated_at,
             secret,
         }
     }
@@ -245,23 +368,38 @@ impl DetailView {
 /// Decrypt a list row into its display label, falling back to a placeholder if the
 /// blob can't be opened (so one bad entry doesn't sink the whole list).
 fn row_from_item(item: PwdListItem, key: &[u8; 32]) -> EntryRow {
-    let (username, url) = match PwdSecret::open(&item.pwd, key) {
+    let (username, url, pwd_preview) = match PwdSecret::open(&item.pwd, key) {
         Ok(secret) => {
             let username = if secret.username.is_empty() {
                 "(no username)".to_string()
             } else {
                 secret.username.clone()
             };
-            (username, secret.url.clone())
+            (username, secret.url.clone(), pwd_preview(&secret.password))
         }
-        Err(_) => ("(unreadable — wrong key?)".to_string(), String::new()),
+        Err(_) => (
+            "(unreadable — wrong key?)".to_string(),
+            String::new(),
+            "—".to_string(),
+        ),
     };
     EntryRow {
         uuid: item.uuid,
         username,
         url,
+        pwd_preview,
         expires: item.expires,
+        valid_since_days: item.valid_since_days,
+        created_at: item.created_at,
+        updated_at: item.updated_at,
     }
+}
+
+/// A list-friendly password hint: the first four characters in clear, the rest
+/// hidden behind a fixed `****`. An empty password shows just the mask.
+fn pwd_preview(password: &str) -> String {
+    let head: String = password.chars().take(4).collect();
+    format!("{head}****")
 }
 
 /// Severity of the status-line message, used only for colour.
@@ -314,11 +452,17 @@ impl Status {
 pub struct App {
     pub config: Config,
     pub screen: Screen,
-    /// Primary text field (passphrase on both entry screens).
+    /// Primary text field (passphrase on the unlock/enroll/refresh screens).
     pub input: String,
-    /// Confirm field (enroll only).
+    /// Passphrase confirm field (enroll only).
     pub confirm: String,
+    /// Account name field (enroll only).
+    pub account_name: String,
+    /// Ehlo secret field (enroll only) — the account's master secret.
+    pub ehlo: String,
     pub enroll_field: EnrollField,
+    /// Whether enrollment creates a new account or signs in (enroll only).
+    pub sign_mode: SignMode,
     pub status: Status,
     /// A command is in flight; entry screens ignore input while set.
     pub busy: bool,
@@ -338,6 +482,12 @@ pub struct App {
     pub reveal: bool,
     /// The new-entry/renew form, when that screen is active.
     pub entry_form: Option<EntryForm>,
+    /// The Ctrl+G password-length picker, when overlaid on the entry form.
+    pub pwd_gen: Option<PwdGen>,
+    /// The most recent custom generated-password length (digits as typed),
+    /// remembered so the picker re-offers it pre-selected instead of making the
+    /// user retype it. Not a secret — just a length preference.
+    last_custom_len: Option<String>,
     /// The new-group form, when that screen is active.
     pub group_form: Option<GroupForm>,
     /// Active entries-list filter (`""` = no filter).
@@ -368,6 +518,8 @@ impl Drop for App {
     fn drop(&mut self) {
         self.input.zeroize();
         self.confirm.zeroize();
+        self.ehlo.zeroize();
+        self.account_name.zeroize();
     }
 }
 
@@ -395,7 +547,10 @@ impl App {
         } else {
             (
                 Screen::Enroll,
-                Status::info("No identity yet — set a master passphrase to enroll this device."),
+                Status::info(
+                    "No account yet — enter a name, ehlo secret, and master passphrase. \
+                     Ctrl+T toggles create/sign-in.",
+                ),
             )
         };
 
@@ -404,7 +559,10 @@ impl App {
             screen,
             input: String::new(),
             confirm: String::new(),
-            enroll_field: EnrollField::Passphrase,
+            account_name: String::new(),
+            ehlo: String::new(),
+            enroll_field: EnrollField::Name,
+            sign_mode: SignMode::SignUp,
             status,
             busy: false,
             verified: false,
@@ -415,6 +573,8 @@ impl App {
             detail: None,
             reveal: false,
             entry_form: None,
+            pwd_gen: None,
+            last_custom_len: None,
             group_form: None,
             search: String::new(),
             searching: false,
@@ -482,6 +642,7 @@ impl App {
         self.detail = None;
         self.groups.clear();
         self.entry_form = None;
+        self.pwd_gen = None;
         self.group_form = None;
         self.search.clear();
         self.searching = false;
@@ -490,6 +651,8 @@ impl App {
         self.verified = false;
         self.busy = false;
         self.input.zeroize();
+        self.ehlo.zeroize();
+        self.account_name.clear();
         self.clipboard.clear();
         self.last_activity = Instant::now();
         self.screen = if self.store.exists() {
@@ -528,10 +691,26 @@ impl App {
             Message::Enrolled(state) => {
                 self.identity = Some(*state);
                 self.busy = false;
+                self.account_name.clear();
+                self.ehlo.zeroize();
                 self.screen = Screen::AwaitingApproval;
-                self.status =
-                    Status::info("Registered. Waiting for an admin to approve this device…");
+                self.status = Status::info(match self.sign_mode {
+                    SignMode::SignUp => {
+                        "Account created. Waiting for an admin to approve this device…"
+                    }
+                    SignMode::SignIn => "Signed in. Waiting for an admin to approve this device…",
+                });
                 vec![Command::Verify { delay_ms: 0 }]
+            }
+            Message::NameTaken => {
+                self.busy = false;
+                self.sign_mode = SignMode::SignIn;
+                self.screen = Screen::Enroll;
+                self.enroll_field = EnrollField::Passphrase;
+                self.status = Status::warning(
+                    "That name is taken — switched to sign in. Re-enter your passphrase and press Enter.",
+                );
+                vec![]
             }
             Message::EnrollFailed(err) => {
                 self.busy = false;
@@ -640,6 +819,16 @@ impl App {
                 self.status = Status::success("Entry saved.");
                 vec![Command::LoadPasswords { expired: false }]
             }
+            Message::EntryUpdated => {
+                self.busy = false;
+                self.entry_form = None;
+                self.screen = Screen::Entries;
+                self.status = Status::success("Entry updated.");
+                // Editing doesn't change expiry, so the row stays in its current
+                // scope — reload whichever list is showing.
+                let expired = self.show_expired;
+                vec![Command::LoadPasswords { expired }]
+            }
             Message::WriteFailed(err) => {
                 self.busy = false;
                 self.status = Status::error(err);
@@ -732,16 +921,26 @@ impl App {
         if self.busy {
             return vec![];
         }
+        // Ctrl+T toggles between creating a new account and signing in.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+            self.sign_mode = self.sign_mode.toggled();
+            self.status = Status::info(match self.sign_mode {
+                SignMode::SignUp => "Mode: create a new account.",
+                SignMode::SignIn => "Mode: sign in to an existing account.",
+            });
+            return vec![];
+        }
         match key.code {
             KeyCode::Esc => {
                 self.running = false;
                 vec![]
             }
-            KeyCode::Tab | KeyCode::Up | KeyCode::Down => {
-                self.enroll_field = match self.enroll_field {
-                    EnrollField::Passphrase => EnrollField::Confirm,
-                    EnrollField::Confirm => EnrollField::Passphrase,
-                };
+            KeyCode::Tab | KeyCode::Down => {
+                self.enroll_field = self.enroll_field.next();
+                vec![]
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                self.enroll_field = self.enroll_field.prev();
                 vec![]
             }
             KeyCode::Enter => self.submit_enroll(),
@@ -759,8 +958,34 @@ impl App {
 
     /// Validate the enroll form and, if it's sound, emit the enroll command.
     fn submit_enroll(&mut self) -> Vec<Command> {
+        let name = self.account_name.trim().to_string();
+        if name.is_empty() {
+            self.status = Status::warning("Enter an account name.");
+            self.enroll_field = EnrollField::Name;
+            return vec![];
+        }
+        if name.chars().count() > MAX_NAME_LEN {
+            self.status =
+                Status::warning(format!("Account name must be ≤{MAX_NAME_LEN} characters."));
+            self.enroll_field = EnrollField::Name;
+            return vec![];
+        }
+        if self.ehlo.is_empty() {
+            self.status = Status::warning("Enter your ehlo secret (your account password).");
+            self.enroll_field = EnrollField::Ehlo;
+            return vec![];
+        }
+        // The ehlo is the account's master secret — enforce a floor when creating
+        // it, but accept whatever an existing account already uses when signing in.
+        if self.sign_mode == SignMode::SignUp && self.ehlo.chars().count() < MIN_EHLO_LEN {
+            self.status = Status::warning(format!(
+                "Ehlo secret must be at least {MIN_EHLO_LEN} characters."
+            ));
+            self.enroll_field = EnrollField::Ehlo;
+            return vec![];
+        }
         if self.input.is_empty() || self.confirm.is_empty() {
-            self.status = Status::warning("Fill in both passphrase fields.");
+            self.status = Status::warning("Fill in both master-passphrase fields.");
             return vec![];
         }
         if self.input != self.confirm {
@@ -775,9 +1000,19 @@ impl App {
         }
         let passphrase = std::mem::take(&mut self.input);
         self.confirm.zeroize();
+        let ehlo = self.ehlo.clone();
+        let mode = self.sign_mode;
         self.busy = true;
-        self.status = Status::info("Generating keys and registering…");
-        vec![Command::Enroll { passphrase }]
+        self.status = Status::info(match mode {
+            SignMode::SignUp => "Generating keys and creating account…",
+            SignMode::SignIn => "Generating keys and signing in…",
+        });
+        vec![Command::Enroll {
+            passphrase,
+            name,
+            ehlo,
+            mode,
+        }]
     }
 
     fn on_key_resign(&mut self, key: KeyEvent) -> Vec<Command> {
@@ -802,6 +1037,8 @@ impl App {
 
     fn focused_field_mut(&mut self) -> &mut String {
         match self.enroll_field {
+            EnrollField::Name => &mut self.account_name,
+            EnrollField::Ehlo => &mut self.ehlo,
             EnrollField::Passphrase => &mut self.input,
             EnrollField::Confirm => &mut self.confirm,
         }
@@ -935,7 +1172,7 @@ impl App {
                 self.reveal = !self.reveal;
                 vec![]
             }
-            KeyCode::Char('e') => self.open_renew_entry(),
+            KeyCode::Char('e') => self.open_edit_entry(),
             KeyCode::Char('c') => self.copy_password(),
             KeyCode::Char('u') => self.copy_username(),
             KeyCode::Char('?') => {
@@ -1040,9 +1277,10 @@ impl App {
         vec![]
     }
 
-    /// Open the new-entry form pre-filled from the entry on the detail screen.
-    /// Saving creates a *new* entry (renew); the old one persists (no update API).
-    fn open_renew_entry(&mut self) -> Vec<Command> {
+    /// Open the entry form pre-filled from the entry on the detail screen. Saving
+    /// updates that same entry in place via `PUT /pwd/update` (no duplicate row);
+    /// the expiry window and `created_at` are left unchanged by the backend.
+    fn open_edit_entry(&mut self) -> Vec<Command> {
         if self.groups.is_empty() {
             self.status = Status::warning("No groups loaded — press g to load groups, then retry.");
             return vec![];
@@ -1071,11 +1309,11 @@ impl App {
             valid_days: valid_days.to_string(),
             group_idx,
             field: EntryField::Password,
-            renewing: true,
+            edit_uuid: Some(detail.uuid.clone()),
         });
         self.screen = Screen::NewEntry;
         self.status =
-            Status::info("Renew — saving creates a new entry; the old one remains until expiry.");
+            Status::info("Edit — saving updates this entry in place (expiry window unchanged).");
         vec![]
     }
 
@@ -1083,14 +1321,21 @@ impl App {
         if self.busy {
             return vec![];
         }
-        // Ctrl+G generates a strong password regardless of the focused field.
+        // While the length picker is open it captures every key (including Esc).
+        if self.pwd_gen.is_some() {
+            return self.on_key_pwd_gen(key);
+        }
+        // Ctrl+G opens the password-length picker (overlaid on the form) so the
+        // user chooses how strong the generated password should be. If they used a
+        // custom length before, it comes back pre-selected so ↵ reuses it.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
-            if let Some(form) = &mut self.entry_form {
-                form.password.zeroize();
-                form.password = crypto::generate_password(GENERATED_PASSWORD_LEN);
-                form.field = EntryField::Password;
-            }
-            self.status = Status::info("Generated a random password.");
+            let remembered = self.last_custom_len.clone();
+            self.pwd_gen = Some(PwdGen::with_remembered_custom(remembered.clone()));
+            self.status = if remembered.is_some() {
+                Status::info("↵ reuses your last custom length, or pick another.")
+            } else {
+                Status::info("Pick a length, or type a custom one, then press ↵.")
+            };
             return vec![];
         }
         match key.code {
@@ -1157,13 +1402,92 @@ impl App {
         }
     }
 
-    /// Validate the new-entry form and, if sound, emit the create command.
+    /// Handle a key while the Ctrl+G length picker is open. Up/Down (or Tab) move
+    /// the cursor; digits feed the custom row; Enter generates; Esc cancels.
+    fn on_key_pwd_gen(&mut self, key: KeyEvent) -> Vec<Command> {
+        match key.code {
+            KeyCode::Esc => {
+                self.pwd_gen = None;
+                self.status = Status::info("Generation cancelled.");
+                vec![]
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                if let Some(gen) = &mut self.pwd_gen {
+                    gen.prev();
+                }
+                vec![]
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                if let Some(gen) = &mut self.pwd_gen {
+                    gen.next();
+                }
+                vec![]
+            }
+            // A digit jumps to the custom row and appends (capped at 3 digits,
+            // since the max length is 256).
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                if let Some(gen) = &mut self.pwd_gen {
+                    gen.idx = PwdGen::CUSTOM_IDX;
+                    if gen.custom.len() < 3 {
+                        gen.custom.push(c);
+                    }
+                }
+                vec![]
+            }
+            KeyCode::Backspace => {
+                if let Some(gen) = &mut self.pwd_gen {
+                    if gen.idx == PwdGen::CUSTOM_IDX {
+                        gen.custom.pop();
+                    }
+                }
+                vec![]
+            }
+            KeyCode::Enter => self.confirm_pwd_gen(),
+            _ => vec![],
+        }
+    }
+
+    /// Generate a password of the chosen length into the form and close the picker.
+    /// A blank or out-of-range custom length warns and keeps the picker open. A
+    /// custom length is remembered so the next Ctrl+G re-offers it pre-selected.
+    fn confirm_pwd_gen(&mut self) -> Vec<Command> {
+        let (len, was_custom) = match self.pwd_gen.as_ref() {
+            Some(gen) => match gen.selected_len() {
+                Some(len) => (len, gen.idx == PwdGen::CUSTOM_IDX),
+                None => {
+                    self.status = Status::warning(format!(
+                        "Enter a length between {MIN_PASSWORD_LEN} and {MAX_PASSWORD_LEN}."
+                    ));
+                    return vec![];
+                }
+            },
+            None => return vec![],
+        };
+        if was_custom {
+            self.last_custom_len = Some(len.to_string());
+        }
+        if let Some(form) = &mut self.entry_form {
+            form.password.zeroize();
+            form.password = crypto::generate_password(len);
+            form.field = EntryField::Password;
+        }
+        self.pwd_gen = None;
+        self.status = Status::success(format!("Generated a {len}-character password."));
+        vec![]
+    }
+
+    /// Validate the entry form and, if sound, emit the write command: an in-place
+    /// [`Command::UpdateEntry`] when editing an existing entry, or a
+    /// [`Command::CreateEntry`] for a brand-new one.
     fn submit_new_entry(&mut self) -> Vec<Command> {
-        let outcome = {
+        let (outcome, edit_uuid) = {
             let Some(form) = self.entry_form.as_ref() else {
                 return vec![];
             };
-            validate_entry_form(form, &self.groups)
+            (
+                validate_entry_form(form, &self.groups),
+                form.edit_uuid.clone(),
+            )
         };
         match outcome {
             Err(status) => {
@@ -1172,13 +1496,28 @@ impl App {
             }
             Ok((secret, group_id, name, valid_since_days)) => {
                 self.busy = true;
-                self.status = Status::info("Saving entry…");
-                vec![Command::CreateEntry {
-                    secret,
-                    group_id,
-                    name,
-                    valid_since_days,
-                }]
+                match edit_uuid {
+                    Some(uuid) => {
+                        // Update endpoint can't change the expiry, so valid_since_days
+                        // is intentionally dropped here.
+                        self.status = Status::info("Updating entry…");
+                        vec![Command::UpdateEntry {
+                            uuid,
+                            secret,
+                            group_id,
+                            name,
+                        }]
+                    }
+                    None => {
+                        self.status = Status::info("Saving entry…");
+                        vec![Command::CreateEntry {
+                            secret,
+                            group_id,
+                            name,
+                            valid_since_days,
+                        }]
+                    }
+                }
             }
         }
     }
@@ -1275,15 +1614,23 @@ impl App {
                     let _ = tx.send(msg);
                 });
             }
-            Command::Enroll { passphrase } => {
+            Command::Enroll {
+                passphrase,
+                name,
+                ehlo,
+                mode,
+            } => {
                 let store = self.store.clone();
                 self.runtime.spawn(async move {
                     let mut passphrase = passphrase;
-                    let outcome = enroll(&client, &store, &passphrase).await;
+                    let mut ehlo = ehlo;
+                    let outcome = enroll(&client, &store, &passphrase, &name, &ehlo, mode).await;
                     passphrase.zeroize();
+                    ehlo.zeroize();
                     let msg = match outcome {
                         Ok(state) => Message::Enrolled(Box::new(state)),
-                        Err(e) => Message::EnrollFailed(e),
+                        Err(EnrollError::NameTaken) => Message::NameTaken,
+                        Err(EnrollError::Msg(e)) => Message::EnrollFailed(e),
                     };
                     let _ = tx.send(msg);
                 });
@@ -1426,6 +1773,35 @@ impl App {
                     let _ = tx.send(msg);
                 });
             }
+            Command::UpdateEntry {
+                uuid,
+                secret,
+                group_id,
+                name,
+            } => {
+                let Some((token, key)) = self.session_credentials() else {
+                    return;
+                };
+                self.runtime.spawn(async move {
+                    // `secret` is dropped (zeroized) when this task ends.
+                    let msg = match secret.seal(&key) {
+                        Ok(pwd) => {
+                            let req = PwdUpdateRequest {
+                                pwd,
+                                group_id,
+                                name,
+                                extra: None,
+                            };
+                            match vault::update_password(&client, &token, &uuid, &req).await {
+                                Ok(()) => Message::EntryUpdated,
+                                Err(e) => Message::WriteFailed(vault_error("update entry", &e)),
+                            }
+                        }
+                        Err(e) => Message::WriteFailed(format!("Couldn't encrypt entry: {e}")),
+                    };
+                    let _ = tx.send(msg);
+                });
+            }
             Command::ClearClipboardAfter { secs } => {
                 let clipboard = self.clipboard.clone();
                 self.runtime.spawn(async move {
@@ -1533,31 +1909,58 @@ fn vault_error(action: &str, err: &ApiError) -> String {
     }
 }
 
-/// Full enrollment: keygen → `/greet` → derive key → seal + `/register` → persist.
+/// Outcome of a failed [`enroll`]: a taken sign-up name (offer sign-in) versus
+/// any other display-ready failure.
+enum EnrollError {
+    /// `/sign-up` returned 409 — the name is already taken.
+    NameTaken,
+    /// Any other failure, with a message to surface verbatim.
+    Msg(String),
+}
+
+/// Full enrollment: keygen → `/greet` → derive key → seal `name`+`ehlo` →
+/// `/sign-up` or `/sign-in` (server issues the token) → persist.
 ///
-/// Returns the established (but unconfirmed) identity, or a display-ready error.
-async fn enroll(client: &ApiClient, store: &Store, passphrase: &str) -> Result<StoreState, String> {
+/// Returns the established (but unconfirmed) identity, or an [`EnrollError`].
+async fn enroll(
+    client: &ApiClient,
+    store: &Store,
+    passphrase: &str,
+    name: &str,
+    ehlo: &str,
+    mode: SignMode,
+) -> Result<StoreState, EnrollError> {
     let keypair = crypto::generate_keypair();
     let server_public = auth::greet(client, &keypair.public)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| EnrollError::Msg(e.to_string()))?;
 
     let shared = crypto::derive_shared_key(&keypair.private, &server_public);
-    let device_token = crypto::random_token();
-    let ehlo_secret = crypto::random_token();
-    let sealed_token = crypto::seal_hex(device_token.as_bytes(), &shared);
-    let sealed_ehlo = crypto::seal_hex(ehlo_secret.as_bytes(), &shared);
+    let sealed_name = crypto::seal_hex(name.as_bytes(), &shared);
+    let sealed_ehlo = crypto::seal_hex(ehlo.as_bytes(), &shared);
 
-    auth::register(client, &sealed_token, &sealed_ehlo)
-        .await
-        .map_err(|e| e.to_string())?;
+    // The server mints and returns the device token (no longer client-chosen).
+    let device_token = match mode {
+        SignMode::SignUp => auth::sign_up(client, &sealed_name, &sealed_ehlo).await,
+        SignMode::SignIn => auth::sign_in(client, &sealed_name, &sealed_ehlo).await,
+    }
+    .map_err(|e| match e {
+        ApiError::Conflict(_) => EnrollError::NameTaken,
+        // We just greeted from this IP, so a sign-in 401 means bad credentials,
+        // not the generic "not approved / IP changed" the message implies.
+        ApiError::Unauthorized if mode == SignMode::SignIn => {
+            EnrollError::Msg("Sign-in failed: unknown name or wrong ehlo.".into())
+        }
+        other => EnrollError::Msg(other.to_string()),
+    })?;
 
     let state = StoreState {
         client_private: keypair.private,
         client_public: keypair.public,
         server_public,
+        user_name: name.to_string(),
         device_token,
-        ehlo_secret,
+        ehlo_secret: ehlo.to_string(),
     };
 
     // Argon2id + write is CPU/IO-bound — keep it off the async worker.
@@ -1566,8 +1969,8 @@ async fn enroll(client: &ApiClient, store: &Store, passphrase: &str) -> Result<S
     let passphrase = passphrase.to_string();
     tokio::task::spawn_blocking(move || store.save(&to_save, &passphrase))
         .await
-        .map_err(|e| format!("save task failed: {e}"))?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| EnrollError::Msg(format!("save task failed: {e}")))?
+        .map_err(|e| EnrollError::Msg(e.to_string()))?;
 
     Ok(state)
 }
@@ -1617,9 +2020,21 @@ mod tests {
             client_private: [1u8; 32],
             client_public: [2u8; 32],
             server_public: [3u8; 32],
+            user_name: "alice".into(),
             device_token: "tok".into(),
             ehlo_secret: "ehlo".into(),
         }
+    }
+
+    /// Type a full enroll form (name, ehlo, passphrase, confirm) in tab order.
+    fn fill_enroll(app: &mut App, name: &str, ehlo: &str, pass: &str, confirm: &str) {
+        type_str(app, name);
+        press(app, KeyCode::Tab);
+        type_str(app, ehlo);
+        press(app, KeyCode::Tab);
+        type_str(app, pass);
+        press(app, KeyCode::Tab);
+        type_str(app, confirm);
     }
 
     fn config_in(dir: &Path) -> Config {
@@ -1686,9 +2101,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
 
-        type_str(&mut app, "longenough1");
-        press(&mut app, KeyCode::Tab);
-        type_str(&mut app, "different22");
+        fill_enroll(
+            &mut app,
+            "alice",
+            "ehlosecret",
+            "longenough1",
+            "different22",
+        );
         let cmds = app.update(Message::Key(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,
@@ -1704,9 +2123,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
 
-        type_str(&mut app, "short"); // < MIN_PASSPHRASE_LEN
-        press(&mut app, KeyCode::Tab);
-        type_str(&mut app, "short");
+        fill_enroll(&mut app, "alice", "ehlosecret", "short", "short"); // < MIN_PASSPHRASE_LEN
         let cmds = app.update(Message::Key(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,
@@ -1717,10 +2134,14 @@ mod tests {
     }
 
     #[test]
-    fn enroll_matching_passphrase_emits_enroll_command() {
+    fn enroll_requires_name() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
 
+        // Skip the name field; fill ehlo + both passphrases.
+        press(&mut app, KeyCode::Tab);
+        type_str(&mut app, "ehlosecret");
+        press(&mut app, KeyCode::Tab);
         type_str(&mut app, "correct horse");
         press(&mut app, KeyCode::Tab);
         type_str(&mut app, "correct horse");
@@ -1729,10 +2150,77 @@ mod tests {
             KeyModifiers::NONE,
         )));
 
-        assert!(
-            matches!(cmds.as_slice(), [Command::Enroll { passphrase }] if passphrase == "correct horse")
+        assert!(cmds.is_empty());
+        assert_eq!(app.status.kind, StatusKind::Warning);
+        assert_eq!(app.enroll_field, EnrollField::Name);
+    }
+
+    #[test]
+    fn enroll_short_ehlo_rejected_on_sign_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+
+        fill_enroll(&mut app, "alice", "short", "correct horse", "correct horse");
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(cmds.is_empty());
+        assert_eq!(app.status.kind, StatusKind::Warning);
+        assert_eq!(app.enroll_field, EnrollField::Ehlo);
+    }
+
+    #[test]
+    fn enroll_complete_form_emits_sign_up_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+
+        fill_enroll(
+            &mut app,
+            "alice",
+            "ehlosecret",
+            "correct horse",
+            "correct horse",
         );
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::Enroll { passphrase, name, ehlo, mode }]
+                if passphrase == "correct horse"
+                    && name == "alice"
+                    && ehlo == "ehlosecret"
+                    && *mode == SignMode::SignUp
+        ));
         assert!(app.busy);
+    }
+
+    #[test]
+    fn enroll_ctrl_t_toggles_sign_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        assert_eq!(app.sign_mode, SignMode::SignUp);
+        press_ctrl(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.sign_mode, SignMode::SignIn);
+        press_ctrl(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.sign_mode, SignMode::SignUp);
+    }
+
+    #[test]
+    fn name_taken_switches_to_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.busy = true;
+        let cmds = app.update(Message::NameTaken);
+        assert!(cmds.is_empty());
+        assert_eq!(app.sign_mode, SignMode::SignIn);
+        assert_eq!(app.screen, Screen::Enroll);
+        assert!(!app.busy);
+        assert_eq!(app.status.kind, StatusKind::Warning);
     }
 
     #[test]
@@ -1758,7 +2246,11 @@ mod tests {
                 uuid: (*uuid).into(),
                 username: (*user).into(),
                 url: String::new(),
+                pwd_preview: "ab****".into(),
                 expires: 7,
+                valid_since_days: 30,
+                created_at: String::new(),
+                updated_at: String::new(),
             })
             .collect()
     }
@@ -1843,11 +2335,13 @@ mod tests {
         let mut app = app_in(dir.path());
         app.screen = Screen::EntryDetail;
         app.detail = Some(DetailView {
+            uuid: "u1".into(),
             name: None,
             group: None,
             expires: 1,
             valid_since_days: 30,
             created_at: String::new(),
+            updated_at: String::new(),
             secret: PwdSecret::default(),
         });
         assert!(!app.reveal);
@@ -1863,11 +2357,13 @@ mod tests {
         let mut app = app_in(dir.path());
         app.screen = Screen::EntryDetail;
         app.detail = Some(DetailView {
+            uuid: "u1".into(),
             name: None,
             group: None,
             expires: 1,
             valid_since_days: 30,
             created_at: String::new(),
+            updated_at: String::new(),
             secret: PwdSecret::default(),
         });
         press(&mut app, KeyCode::Esc);
@@ -1962,15 +2458,127 @@ mod tests {
     }
 
     #[test]
-    fn new_entry_ctrl_g_generates_password() {
+    fn new_entry_ctrl_g_opens_length_picker() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
         app.screen = Screen::NewEntry;
         app.entry_form = Some(EntryForm::blank(0));
         press_ctrl(&mut app, KeyCode::Char('g'));
+        // The picker opens; the password is untouched until a length is confirmed.
+        assert!(app.pwd_gen.is_some());
+        assert!(app.entry_form.as_ref().unwrap().password.is_empty());
+    }
+
+    #[test]
+    fn pwd_gen_enter_generates_preset_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.entry_form = Some(EntryForm::blank(0));
+        press_ctrl(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Enter); // first preset
+        assert!(app.pwd_gen.is_none());
         let form = app.entry_form.as_ref().unwrap();
-        assert_eq!(form.password.chars().count(), GENERATED_PASSWORD_LEN);
+        assert_eq!(form.password.chars().count(), PWD_GEN_PRESETS[0]);
         assert_eq!(form.field, EntryField::Password);
+    }
+
+    #[test]
+    fn pwd_gen_custom_digits_generate_typed_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.entry_form = Some(EntryForm::blank(0));
+        press_ctrl(&mut app, KeyCode::Char('g'));
+        // Typing digits jumps to the custom row and fills it.
+        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.pwd_gen.is_none());
+        assert_eq!(
+            app.entry_form.as_ref().unwrap().password.chars().count(),
+            42
+        );
+    }
+
+    #[test]
+    fn pwd_gen_esc_closes_without_touching_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.entry_form = Some(EntryForm::blank(0));
+        press_ctrl(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Esc);
+        // Esc closes only the picker; the form (and screen) stay put.
+        assert!(app.pwd_gen.is_none());
+        assert!(app.entry_form.is_some());
+        assert_eq!(app.screen, Screen::NewEntry);
+        assert!(app.entry_form.as_ref().unwrap().password.is_empty());
+    }
+
+    #[test]
+    fn pwd_gen_remembers_last_custom_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.entry_form = Some(EntryForm::blank(0));
+        // First time: type a custom length and generate.
+        press_ctrl(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('0'));
+        press(&mut app, KeyCode::Char('0'));
+        press(&mut app, KeyCode::Enter);
+        // Reopen: the custom row is pre-selected and pre-filled with "100".
+        press_ctrl(&mut app, KeyCode::Char('g'));
+        {
+            let gen = app.pwd_gen.as_ref().unwrap();
+            assert_eq!(gen.idx, PwdGen::CUSTOM_IDX);
+            assert_eq!(gen.custom, "100");
+        }
+        // Pressing ↵ reuses it without retyping.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.pwd_gen.is_none());
+        assert_eq!(
+            app.entry_form.as_ref().unwrap().password.chars().count(),
+            100
+        );
+    }
+
+    #[test]
+    fn pwd_gen_preset_does_not_overwrite_remembered_custom() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.entry_form = Some(EntryForm::blank(0));
+        // Remember a custom length.
+        press_ctrl(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Enter);
+        // Now generate from a preset instead.
+        press_ctrl(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Up); // wrap to the custom row, then up again to a preset
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        // The remembered custom survives a preset generation.
+        press_ctrl(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.pwd_gen.as_ref().unwrap().custom, "42");
+    }
+
+    #[test]
+    fn pwd_gen_empty_custom_warns_and_stays_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.entry_form = Some(EntryForm::blank(0));
+        press_ctrl(&mut app, KeyCode::Char('g'));
+        // Move onto the custom row but type nothing, then confirm.
+        for _ in 0..PwdGen::CUSTOM_IDX {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.pwd_gen.is_some());
+        assert_eq!(app.status.kind, StatusKind::Warning);
     }
 
     #[test]
@@ -2048,17 +2656,19 @@ mod tests {
     }
 
     #[test]
-    fn detail_e_opens_prefilled_renew() {
+    fn detail_e_opens_prefilled_edit() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
         app.screen = Screen::EntryDetail;
         app.groups = group_rows(&[("g1", "Work"), ("g2", "Home")]);
         app.detail = Some(DetailView {
+            uuid: "entry-1".into(),
             name: Some("GitHub".into()),
             group: Some("Home".into()),
             expires: 5,
             valid_since_days: 60,
             created_at: "2026-06-01".into(),
+            updated_at: "2026-06-02".into(),
             secret: PwdSecret {
                 username: "alice".into(),
                 password: "old-pw".into(),
@@ -2070,10 +2680,52 @@ mod tests {
         press(&mut app, KeyCode::Char('e'));
         assert_eq!(app.screen, Screen::NewEntry);
         let form = app.entry_form.as_ref().unwrap();
-        assert!(form.renewing);
+        // The form is bound to the existing entry, so saving updates it in place.
+        assert_eq!(form.edit_uuid.as_deref(), Some("entry-1"));
         assert_eq!(form.password, "old-pw");
         assert_eq!(form.group_idx, 1); // matched "Home"
         assert_eq!(form.valid_days, "60");
+    }
+
+    #[test]
+    fn edit_form_submit_emits_update_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.groups = group_rows(&[("g1", "Work")]);
+        let mut form = EntryForm::blank(0);
+        form.edit_uuid = Some("entry-1".into());
+        form.password = "new-pw".into();
+        form.username = "alice".into();
+        app.entry_form = Some(form);
+
+        let cmds = app.update(Message::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::UpdateEntry { uuid, group_id, secret, .. }]
+                if uuid == "entry-1" && group_id == "g1" && secret.password == "new-pw"
+        ));
+        assert!(app.busy);
+    }
+
+    #[test]
+    fn entry_updated_returns_to_entries_and_reloads_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        app.screen = Screen::NewEntry;
+        app.show_expired = true; // editing keeps the current scope
+        app.entry_form = Some(EntryForm::blank(0));
+        let cmds = app.update(Message::EntryUpdated);
+        assert_eq!(app.screen, Screen::Entries);
+        assert!(app.entry_form.is_none());
+        assert!(app.show_expired); // unchanged, unlike a create
+        assert!(matches!(
+            cmds.as_slice(),
+            [Command::LoadPasswords { expired: true }]
+        ));
     }
 
     #[test]
@@ -2276,11 +2928,13 @@ mod tests {
         let mut app = app_in(dir.path());
         app.screen = Screen::EntryDetail;
         app.detail = Some(DetailView {
+            uuid: "u1".into(),
             name: None,
             group: None,
             expires: 1,
             valid_since_days: 30,
             created_at: String::new(),
+            updated_at: String::new(),
             secret: PwdSecret::default(), // empty password
         });
         let cmds = app.update(Message::Key(KeyEvent::new(

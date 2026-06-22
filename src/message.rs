@@ -12,7 +12,7 @@
 
 use ratatui::crossterm::event::KeyEvent;
 
-use crate::app::{DetailView, EntryRow, GroupRow};
+use crate::app::{DetailView, EntryRow, GroupRow, SignMode};
 use crate::secret::PwdSecret;
 use crate::store::StoreState;
 
@@ -26,9 +26,11 @@ pub enum Message {
     /// Decrypting the store failed (wrong passphrase or corrupt file).
     UnlockFailed(String),
 
-    /// Enrollment succeeded: keys generated, registered, and persisted.
+    /// Enrollment succeeded: keys generated, signed up/in, and persisted.
     Enrolled(Box<StoreState>),
-    /// Enrollment failed somewhere in greet → register → save.
+    /// `/sign-up` returned 409 — the chosen name is taken; offer to sign in instead.
+    NameTaken,
+    /// Enrollment failed somewhere in greet → sign-up/sign-in → save.
     EnrollFailed(String),
 
     /// `/verify` returned 200 — the device is approved and the session is live.
@@ -54,8 +56,10 @@ pub enum Message {
 
     /// A group was created.
     GroupCreated,
-    /// An entry was created (or renewed — a renew is just a new create).
+    /// An entry was created (a brand-new entry, or a renew — a fresh create).
     EntryCreated,
+    /// An existing entry was updated in place (the edit flow; no duplicate row).
+    EntryUpdated,
     /// A vault write (create group/entry) failed; message is display-ready.
     WriteFailed(String),
 
@@ -73,8 +77,15 @@ pub enum Message {
 pub enum Command {
     /// Decrypt the local store with this passphrase.
     Unlock { passphrase: String },
-    /// Generate keys, greet + register, and persist the store under this passphrase.
-    Enroll { passphrase: String },
+    /// Generate keys, greet, then `/sign-up` (new account) or `/sign-in`
+    /// (existing) with `name` + `ehlo`, and persist the store under `passphrase`.
+    /// `ehlo`/`passphrase` are zeroized by the executor once consumed.
+    Enroll {
+        passphrase: String,
+        name: String,
+        ehlo: String,
+        mode: SignMode,
+    },
     /// Poll `/verify`, optionally after a delay (used to debounce approval polling).
     Verify { delay_ms: u64 },
     /// Re-bind the current identity to this IP via `/re-sign`.
@@ -94,6 +105,14 @@ pub enum Command {
         group_id: String,
         name: Option<String>,
         valid_since_days: i64,
+    },
+    /// Seal `secret` and overwrite the entry `uuid` in place via `PUT /pwd/update`
+    /// (the edit flow). Expiry/`created_at` are left unchanged by the backend.
+    UpdateEntry {
+        uuid: String,
+        secret: PwdSecret,
+        group_id: String,
+        name: Option<String>,
     },
     /// Clear the clipboard after `secs` seconds (the copy auto-clear timer).
     ClearClipboardAfter { secs: u64 },

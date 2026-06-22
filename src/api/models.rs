@@ -21,22 +21,30 @@ pub struct GreetResponse {
     pub server_public_key: String,
 }
 
-/// `POST /register` request.
+/// `POST /sign-up` and `POST /sign-in` request — identical shape.
 ///
-/// `token` is `hex(seal(device_token))` and `ehlo` is `hex(seal(ehlo_secret))`.
-/// (Note: `/re-sign` later sends `token` as *plain* hex — see protocol-notes —
-/// but at register both fields are sealed.)
+/// `name` is `hex(seal(user_name))` and `ehlo` is `hex(seal(ehlo_secret))`; the
+/// account is identified by the (cleartext, server-side) name and proven by the
+/// ehlo secret. Successful decryption also proves this device holds the client
+/// private key from `/greet`.
 #[derive(Debug, Serialize)]
-pub struct RegisterRequest {
-    /// Sealed device token, hex.
-    pub token: String,
+pub struct SignRequest {
+    /// Sealed user name, hex.
+    pub name: String,
     /// Sealed ehlo secret, hex.
     pub ehlo: String,
 }
 
+/// `POST /sign-up` and `POST /sign-in` response — the server-issued device token
+/// to persist and send in the `device-token` header thereafter.
+#[derive(Debug, Deserialize)]
+pub struct SignResponse {
+    pub token: String,
+}
+
 /// `POST /re-sign` request — re-bind an existing identity to the caller's IP.
 ///
-/// ⚠️ Unlike [`RegisterRequest`], `token` here is the **plain** hex of the raw
+/// ⚠️ Unlike [`RefreshRequest`], `token` here is the **plain** hex of the raw
 /// token bytes (NOT sealed); only `ehlo` is sealed. See `docs/protocol-notes.md`
 /// (api.md is wrong on this). The server resets `is_confirmed=false` afterwards.
 #[derive(Debug, Serialize)]
@@ -50,7 +58,8 @@ pub struct ReSignRequest {
 /// `POST /refresh` request — rotate the device token (looked up by source IP).
 ///
 /// Both fields are sealed hex: `token` = `hex(seal(current_token))` and `ehlo` =
-/// `hex(seal(ehlo_secret))`. Same shape as [`RegisterRequest`], distinct intent.
+/// `hex(seal(ehlo_secret))`. Same shape as [`ReSignRequest`], but the token is
+/// sealed here (re-sign sends it plain).
 #[derive(Debug, Serialize)]
 pub struct RefreshRequest {
     /// Sealed *current* device token, hex.
@@ -76,9 +85,9 @@ pub struct GroupCreateRequest {
 
 /// `POST /pwd/create` request. `pwd` is sealed hex; `name`/`extra` are **plaintext**
 /// server-side (never secrets). `valid_since_days` (1–365, default 30 server-side)
-/// sets the expiry window. There is no update endpoint, so a "renew" is just a fresh
-/// create (see `docs/protocol-notes.md`); `None` fields are omitted so the server
-/// applies its defaults.
+/// sets the expiry window. `None` fields are omitted so the server applies its
+/// defaults. To change an entry's *content* in place use [`PwdUpdateRequest`]; a
+/// create is for brand-new entries (or a renew that resets the expiry clock).
 #[derive(Debug, Serialize)]
 pub struct PwdCreateRequest {
     pub pwd: String,
@@ -89,6 +98,19 @@ pub struct PwdCreateRequest {
     pub extra: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_since_days: Option<i64>,
+}
+
+/// `PUT /pwd/update/{uuid}` request — overwrite an existing entry's content in
+/// place. Same shape as create minus `valid_since_days`: the backend never changes
+/// the expiry window or `created_at` on update (see `docs/protocol-notes.md` row 11).
+#[derive(Debug, Serialize)]
+pub struct PwdUpdateRequest {
+    pub pwd: String,
+    pub group_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<String>,
 }
 
 /// `GET /group/list` item, and the `POST /group/create` response (plaintext).
@@ -111,6 +133,8 @@ pub struct PwdListItem {
     pub expires: i64,
     #[serde(default)]
     pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
     #[serde(default)]
     pub valid_since_days: i64,
 }
@@ -138,6 +162,8 @@ pub struct PwdDetail {
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
     pub valid_since_days: i64,
     #[serde(default)]
     pub group: Option<GroupRef>,
@@ -164,13 +190,19 @@ mod tests {
     }
 
     #[test]
-    fn register_request_has_token_and_ehlo() {
-        let json = serde_json::to_value(RegisterRequest {
-            token: "aa".into(),
+    fn sign_request_has_name_and_ehlo() {
+        let json = serde_json::to_value(SignRequest {
+            name: "aa".into(),
             ehlo: "bb".into(),
         })
         .unwrap();
-        assert_eq!(json, serde_json::json!({ "token": "aa", "ehlo": "bb" }));
+        assert_eq!(json, serde_json::json!({ "name": "aa", "ehlo": "bb" }));
+    }
+
+    #[test]
+    fn sign_response_deserializes_token() {
+        let resp: SignResponse = serde_json::from_str(r#"{"token":"raw-uuid"}"#).unwrap();
+        assert_eq!(resp.token, "raw-uuid");
     }
 
     #[test]

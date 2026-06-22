@@ -20,10 +20,17 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+To exercise the TUI end-to-end against a running backend (enrollment, device
+approval, re-sign, refresh) and for the state-reset gotchas, see
+[`docs/testing.md`](docs/testing.md).
+
 ## First run & the session flow
 
-1. **Enroll** — with no local store, pick a master passphrase. The app generates an
-   X25519 keypair, greets the server, registers a sealed device token, and waits.
+1. **Enroll** — with no local store, enter your account **name**, **ehlo** secret,
+   and a local **master passphrase**. The app generates an X25519 keypair, greets the
+   server, then **signs up** (new account) or **signs in** (existing one — toggle with
+   `Ctrl+T`) with the sealed name + ehlo, stores the server-issued device token, and
+   waits. A taken name on sign-up auto-switches to sign-in.
 2. **Awaiting approval** — an administrator must approve the device out of band; the
    app polls until it's approved.
 3. **Unlock** — on later runs, your passphrase decrypts the local store and the app
@@ -36,6 +43,7 @@ Navigation is arrow/letter style (`Esc` goes back or quits).
 
 | Screen | Keys |
 |--------|------|
+| **Enroll** | `Tab`/`↑↓` move fields · `Ctrl+T` create-account/sign-in · `Enter` submit · `Esc` quit |
 | **Entries** | `↑`/`↓` move · `Enter` open · `n` new · `/` search · `t` valid/expired · `g` groups · `r` refresh · `Ctrl+R` rotate device token · `?` help · `q` quit |
 | **Entry detail** | `s` reveal/hide password · `c` copy password · `u` copy username · `e` renew · `Esc` back |
 | **New entry** | `Tab`/`↑↓` move fields · `←`/`→` pick group · `Ctrl+G` generate password · `Enter` save · `Esc` cancel |

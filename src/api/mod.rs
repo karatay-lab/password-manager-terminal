@@ -1,7 +1,7 @@
 //! HTTP client for the password-manager backend.
 //!
 //! - [`ApiClient`] — configured reqwest wrapper (base URL, timeout, TLS).
-//! - [`auth`] — enrollment + session endpoints (`/greet`, `/register`, `/verify`).
+//! - [`auth`] — enrollment + session endpoints (`/greet`, `/sign-up`, `/sign-in`, `/verify`).
 //! - [`vault`] — read-side group/password endpoints.
 //! - [`ApiError`] — typed errors with a verified status-code mapping.
 //!

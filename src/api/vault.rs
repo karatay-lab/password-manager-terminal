@@ -7,7 +7,9 @@
 
 use super::client::{check_status, ApiClient, DEVICE_TOKEN_HEADER};
 use super::error::ApiError;
-use super::models::{GroupCreateRequest, GroupSummary, PwdCreateRequest, PwdDetail, PwdListItem};
+use super::models::{
+    GroupCreateRequest, GroupSummary, PwdCreateRequest, PwdDetail, PwdListItem, PwdUpdateRequest,
+};
 
 /// `GET /group/list` — all groups (plaintext metadata).
 pub async fn list_groups(
@@ -24,7 +26,8 @@ pub async fn list_groups(
     Ok(resp.json().await?)
 }
 
-/// `GET /pwd/list/valid` or `/pwd/list/expired` — entry rows with sealed `pwd`.
+/// `GET /pwd/list` — entry rows with sealed `pwd`. `?expired=true` returns only
+/// expired entries; omitting it returns the valid (non-expired) ones.
 ///
 /// Uses the server's default page size; pagination is deferred (plan §2).
 pub async fn list_passwords(
@@ -32,17 +35,14 @@ pub async fn list_passwords(
     device_token: &str,
     expired: bool,
 ) -> Result<Vec<PwdListItem>, ApiError> {
-    let path = if expired {
-        "/pwd/list/expired"
-    } else {
-        "/pwd/list/valid"
-    };
-    let resp = client
+    let mut req = client
         .http()
-        .get(client.url(path))
-        .header(DEVICE_TOKEN_HEADER, device_token)
-        .send()
-        .await?;
+        .get(client.url("/pwd/list"))
+        .header(DEVICE_TOKEN_HEADER, device_token);
+    if expired {
+        req = req.query(&[("expired", "true")]);
+    }
+    let resp = req.send().await?;
     let resp = check_status(resp).await?;
     Ok(resp.json().await?)
 }
@@ -87,8 +87,9 @@ pub async fn create_group(
 
 /// `POST /pwd/create` — store a new (sealed) entry, returning the created row.
 ///
-/// Also the only way to "renew" an expiring entry — the backend has no update
-/// endpoint, so a renew is a fresh create (the old row persists). See plan §8.
+/// Use this for brand-new entries, or to "renew" an expiring one with a fresh
+/// expiry clock (a renew is a new create; the old row persists). To change an
+/// existing entry's content in place, use [`update_password`] instead.
 pub async fn create_password(
     client: &ApiClient,
     device_token: &str,
@@ -103,4 +104,25 @@ pub async fn create_password(
         .await?;
     let resp = check_status(resp).await?;
     Ok(resp.json().await?)
+}
+
+/// `PUT /pwd/update/{uuid}` — overwrite an existing entry's content in place
+/// (no duplicate row). Updates `pwd`/`group`/`name`/`extra` but NOT the expiry
+/// window or `created_at` — the backend leaves `valid_since_days` untouched
+/// (see `docs/protocol-notes.md` row 11). Returns `null` on success.
+pub async fn update_password(
+    client: &ApiClient,
+    device_token: &str,
+    uuid: &str,
+    req: &PwdUpdateRequest,
+) -> Result<(), ApiError> {
+    let resp = client
+        .http()
+        .put(client.url(&format!("/pwd/update/{uuid}")))
+        .header(DEVICE_TOKEN_HEADER, device_token)
+        .json(req)
+        .send()
+        .await?;
+    check_status(resp).await?;
+    Ok(())
 }
