@@ -5,56 +5,74 @@ A terminal (TUI) client for a zero-knowledge password-manager backend, built wit
 X25519 ECDH + AES-256-GCM; the server only ever stores ciphertext. Long-lived
 credentials live in an encrypted local store, unlocked with a master passphrase.
 
-Runs on **Linux** and **Windows** (and macOS). There are no native packaged
-installers yet — you install by building from source with the Rust toolchain, as
-described below.
+Runs on **Linux** and **Windows** (and macOS). Most users should grab a prebuilt
+installer (no Rust toolchain needed); building from source is also supported.
 
 ## Install
 
-### 1. Prerequisites
+Two ways to install — pick the **packaged installer** unless there's none for your
+platform, in which case build from source.
 
-- A recent **stable Rust toolchain**, via [rustup](https://rustup.rs). This is the
-  only hard build dependency — the client uses `rustls`, so **no OpenSSL/system TLS
-  libraries are required**.
-- **Linux only:** copy/paste to the system clipboard needs a running **X11 or
-  Wayland** session at runtime. In a headless/SSH session the app still works; it
-  just reports that the clipboard is unavailable instead of copying.
-- **Windows only:** the MSVC toolchain (`rustup default stable-msvc`, the default on
-  Windows) plus the Visual Studio C++ Build Tools that rustup prompts for.
+### Packaged installer (recommended — no toolchain)
 
-### 2. Build & install the binary
+Download the latest `.deb` or `.msi` from the
+[**Releases**](https://github.com/karatay-lab/password-manager-terminal/releases) page:
 
-The crate builds a single executable named `pwd-manager-terminal`
-(`pwd-manager-terminal.exe` on Windows).
+- **Linux (Debian/Ubuntu & derivatives):**
+
+  ```sh
+  sudo apt install ./pwd-manager-terminal_<version>-1_amd64.deb   # resolves deps
+  # or: sudo dpkg -i pwd-manager-terminal_<version>-1_amd64.deb
+  ```
+
+  Installs `pwd-manager-terminal` to `/usr/bin` (already on `PATH`); a sample config
+  lands at `/usr/share/doc/pwd-manager-terminal/env.example`.
+
+- **Windows:** run `pwd-manager-terminal-<version>-x86_64.msi` and follow the wizard.
+  It installs into *Program Files* and offers to add itself to `PATH`. Uninstall via
+  *Settings → Apps → Installed apps*.
+
+Then [configure](#configure) and run `pwd-manager-terminal`.
+
+### Build from source
+
+Requires a recent **stable Rust toolchain** via [rustup](https://rustup.rs) — the
+only hard build dependency, since the client is `rustls`-based (**no OpenSSL/system
+TLS libraries**). On Windows use the default MSVC toolchain
+(`rustup default stable-msvc`) plus the C++ Build Tools rustup prompts for.
 
 ```sh
 git clone https://github.com/karatay-lab/password-manager-terminal.git
 cd password-manager-terminal
-
-# Option A — install onto your PATH (recommended).
-# Drops the binary in ~/.cargo/bin (Linux) / %USERPROFILE%\.cargo\bin (Windows),
-# which rustup already adds to PATH. Afterwards just run: pwd-manager-terminal
-cargo install --path .
-
-# Option B — build in place, run from the target dir.
-cargo build --release
-#   Linux:   ./target/release/pwd-manager-terminal
-#   Windows: .\target\release\pwd-manager-terminal.exe
+cargo install --path .        # installs `pwd-manager-terminal` onto your PATH
+# …or `cargo build --release` and run ./target/release/pwd-manager-terminal[.exe]
 ```
 
-### 3. Configure
+> **Linux clipboard:** copy/paste needs a running **X11 or Wayland** session at
+> runtime. In a headless/SSH session the app still works — it just reports that the
+> clipboard is unavailable instead of copying.
 
-The app reads its settings from environment variables, or from a `.env` file in the
-directory you launch it from. Copy the template and point it at your backend:
+### Configure
+
+The app reads settings from **environment variables** and from `.env` files, merged
+at startup in this precedence (highest first):
+
+1. Real environment variables already set in your shell.
+2. `./.env` — the directory you launch from (handy for development).
+3. `~/.config/pwd-manager-terminal/.env` — per-user
+   (`%APPDATA%\pwd-manager-terminal\.env` on Windows; honours `$XDG_CONFIG_HOME`).
+4. `/etc/pwd-manager-terminal/.env` — system-wide (Linux/macOS).
+
+Copy the template into whichever location suits you and point it at your backend:
 
 ```sh
-cp .env.example .env      # then edit PWM_API_BASE_URL etc. — no secrets go here
+mkdir -p ~/.config/pwd-manager-terminal
+cp .env.example ~/.config/pwd-manager-terminal/.env   # then edit PWM_API_BASE_URL
+# (from a .deb install, the template is /usr/share/doc/pwd-manager-terminal/env.example)
 ```
 
-At minimum set **`PWM_API_BASE_URL`** to your backend. See
-[Configuration](#configuration) for the full list. If you installed onto your PATH
-and run the binary from arbitrary directories, prefer setting real environment
-variables (a `.env` is only picked up from the current working directory).
+At minimum set **`PWM_API_BASE_URL`**. See [Configuration](#configuration) for the
+full list of variables.
 
 > **Windows data-dir note.** The default `PWM_DATA_DIR=~/.pwd-manager` only expands
 > when a `HOME` variable is set, which Windows usually does **not** have. On Windows,
@@ -62,10 +80,10 @@ variables (a `.env` is only picked up from the current working directory).
 > or define `HOME`. Otherwise the store lands in a literal `~` folder under your
 > current directory.
 
-### 4. Run
+### Run
 
 ```sh
-pwd-manager-terminal          # if installed via Option A
+pwd-manager-terminal
 ```
 
 ## First run & the session flow
@@ -139,19 +157,22 @@ Remove-Item -Force "$env:USERPROFILE\.pwd-manager\store.enc"
 ## Uninstall
 
 1. Quit the app.
-2. Remove the binary:
-   - Installed via `cargo install`: `cargo uninstall pwd-manager-terminal`.
-   - Built in place: delete `target/release/pwd-manager-terminal[.exe]` (or the whole
-     checkout).
-3. Delete local state to leave nothing behind:
+2. Remove the program, by how you installed it:
+   - **`.deb`:** `sudo apt remove pwd-manager-terminal` (or `sudo dpkg -r pwd-manager-terminal`).
+   - **`.msi`:** *Settings → Apps → Installed apps → pwd-manager-terminal → Uninstall*.
+   - **`cargo install`:** `cargo uninstall pwd-manager-terminal`.
+   - **Built in place:** delete `target/release/pwd-manager-terminal[.exe]` (or the
+     whole checkout).
+3. Delete local state and any config to leave nothing behind:
 
    ```sh
    # Linux / macOS
-   rm -rf ~/.pwd-manager
+   rm -rf ~/.pwd-manager ~/.config/pwd-manager-terminal
+   sudo rm -rf /etc/pwd-manager-terminal      # only if you created a system config
    rm -f .env
 
    # Windows (PowerShell)
-   Remove-Item -Recurse -Force "$env:USERPROFILE\.pwd-manager"
+   Remove-Item -Recurse -Force "$env:USERPROFILE\.pwd-manager", "$env:APPDATA\pwd-manager-terminal"
    ```
 
 4. **Optional but recommended:** ask an administrator to revoke this device on the
@@ -159,15 +180,15 @@ Remove-Item -Force "$env:USERPROFILE\.pwd-manager\store.enc"
 
 ## Configuration
 
-All settings come from the environment (or a `.env` in the working directory); see
-[`.env.example`](.env.example).
+All settings come from the environment (or one of the layered `.env` files described
+under [Configure](#configure)); see [`.env.example`](.env.example).
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `PWM_API_BASE_URL` | `http://localhost:53971` | Backend base URL (no trailing slash) |
 | `PWM_REQUEST_TIMEOUT_SECS` | `30` | HTTP request timeout |
 | `PWM_VERIFY_TLS` | `true` | Verify TLS certificates |
-| `PWM_DATA_DIR` | `~/.pwd-manager` | Where the encrypted local store lives (see the Windows note under [Install](#3-configure)) |
+| `PWM_DATA_DIR` | `~/.pwd-manager` | Where the encrypted local store lives (see the Windows note under [Configure](#configure)) |
 | `PWM_CLIPBOARD_CLEAR_SECS` | `30` | Seconds before copied secrets are wiped |
 | `PWM_IDLE_LOCK_SECS` | `300` | Idle seconds before auto-lock (`0` disables) |
 

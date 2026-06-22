@@ -1,0 +1,79 @@
+name: release
+
+# Build distributable installers on a version tag and publish them to a GitHub
+# Release. Users then download and install with NO Rust toolchain:
+#   Linux:   sudo apt install ./pwd-manager-terminal_<ver>-1_amd64.deb
+#   Windows: run pwd-manager-terminal-<ver>-x86_64.msi
+#
+# Tag a release with:  git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {} # allow manual runs to smoke-test the build (no release published)
+
+permissions:
+  contents: write # needed to create the Release and upload assets
+
+jobs:
+  # ── Linux .deb ──────────────────────────────────────────────────────────────
+  # Built on the OLDEST supported Ubuntu so the glibc version requirement stays
+  # low and the package installs on as many distros as possible.
+  deb:
+    name: Build .deb (amd64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+      - name: Build package
+        run: cargo deb --output target/debian/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+  # ── Windows .msi ────────────────────────────────────────────────────────────
+  msi:
+    name: Build .msi (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install WiX Toolset v3
+        run: choco install wixtoolset --no-progress -y
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --locked
+      - name: Build release binary
+        run: cargo build --release
+        # Build explicitly so a compile error fails fast with normal cargo output;
+        # `--no-build` below then just runs WiX against this binary.
+      - name: Build installer
+        run: cargo wix --no-build --nocapture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msi
+          path: target/wix/*.msi
+          if-no-files-found: error
+
+  # ── Publish the GitHub Release (tag pushes only) ────────────────────────────
+  release:
+    name: Publish release
+    needs: [deb, msi]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

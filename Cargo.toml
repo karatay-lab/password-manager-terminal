@@ -2,8 +2,35 @@
 name = "pwd-manager-terminal"
 version = "0.1.0"
 edition = "2021"
+authors = ["Berkay Karatay <karatay.berkay@gmail.com>"]
 description = "Terminal password manager — a ratatui TUI client"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/karatay-lab/password-manager-terminal"
+
+# ── Debian package (cargo deb) ───────────────────────────────────────────────
+# Build with `cargo deb`; output lands in target/debian/*.deb. Users install with
+# `sudo apt install ./pwd-manager-terminal_<ver>-1_amd64.deb` — no Rust required.
+[package.metadata.deb]
+maintainer = "Berkay Karatay <karatay.berkay@gmail.com>"
+copyright = "2026, Berkay Karatay"
+license-file = ["LICENSE", "0"]
+section = "utils"
+priority = "optional"
+# Let dpkg-shlibdeps compute the real shared-lib deps (libc6, …). The client is
+# rustls-based, so there is no OpenSSL dependency.
+depends = "$auto"
+extended-description = """\
+A terminal (TUI) client for a zero-knowledge password-manager backend. Secrets \
+are sealed and opened client-side with X25519 ECDH + AES-256-GCM; the server \
+only ever stores ciphertext. Credentials live in an encrypted local store \
+unlocked with a master passphrase."""
+assets = [
+    ["target/release/pwd-manager-terminal", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/pwd-manager-terminal/README.md", "644"],
+    [".env.example", "usr/share/doc/pwd-manager-terminal/env.example", "644"],
+    ["LICENSE", "usr/share/doc/pwd-manager-terminal/LICENSE", "644"],
+]
 
 [dependencies]
 ratatui = "0.30"          # TUI framework (re-exports crossterm)

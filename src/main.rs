@@ -8,8 +8,9 @@ fn main() -> Result<()> {
     // terminal is restored *before* the report is printed.
     color_eyre::install()?;
 
-    // Load .env if present; missing file is fine (env vars may be set another way).
-    let _ = dotenvy::dotenv();
+    // Merge .env layers (cwd, ~/.config, /etc) into the environment; all are
+    // optional. Lets a globally installed binary find config outside its cwd.
+    pwd_manager_terminal::config::load_env_files();
     let config = Config::from_env();
 
     // Build the app (HTTP client, runtime, store) before entering raw mode so an
