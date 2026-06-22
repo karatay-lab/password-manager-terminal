@@ -71,9 +71,17 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Stage assets under stable, version-less names
+        # cargo-deb/cargo-wix embed the version in the filename; rename to fixed
+        # names so the README's /releases/latest/download/<name> curl commands keep
+        # working across every release.
+        run: |
+          mkdir -p out
+          cp dist/*_amd64.deb  out/pwd-manager-terminal-linux-amd64.deb
+          cp dist/*-x86_64.msi out/pwd-manager-terminal-windows-x86_64.msi
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: out/*
           generate_release_notes: true
           fail_on_unmatched_files: true
