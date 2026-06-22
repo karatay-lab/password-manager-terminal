@@ -1210,13 +1210,17 @@ impl App {
     }
 
     /// Copy `text` to the clipboard and, if a clear window is configured, schedule the
-    /// auto-clear. Reports gracefully when no clipboard backend is available.
-    fn copy_to_clipboard(&mut self, text: String, label: &str) -> Vec<Command> {
+    /// auto-clear. Reports gracefully when no clipboard backend is available. Takes
+    /// `text` by value and zeroizes this local plaintext copy once handed off (the
+    /// clipboard itself is wiped by its own auto-clear timer).
+    fn copy_to_clipboard(&mut self, mut text: String, label: &str) -> Vec<Command> {
         if text.is_empty() {
             self.status = Status::warning(format!("{label} is empty — nothing to copy."));
             return vec![];
         }
-        if !self.clipboard.set(&text) {
+        let copied = self.clipboard.set(&text);
+        text.zeroize();
+        if !copied {
             self.status = Status::error("Clipboard unavailable in this environment.");
             return vec![];
         }

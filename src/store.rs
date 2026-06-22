@@ -16,6 +16,7 @@
 //! (and Argon2id's cost) to recover anything. We chose passphrase-encryption over an
 //! OS keyring because the target runs headless, where no Secret Service is available.
 
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -224,14 +225,45 @@ fn set_dir_private(dir: &Path) {
     let _ = dir;
 }
 
-/// Expand a leading `~`/`~/` to `$HOME`; otherwise return the path unchanged.
+/// Expand a leading `~`/`~/` to the user's home directory; otherwise return the
+/// path unchanged.
 fn expand_tilde(path: &str) -> PathBuf {
+    expand_tilde_with(path, home_dir())
+}
+
+/// The user's home directory: `$HOME` (Unix/macOS), falling back to
+/// `%USERPROFILE%` on Windows, where `HOME` is usually unset. Without this
+/// fallback the default `~/.pwd-manager` would land in a literal `~` folder under
+/// the launch directory on a stock Windows session.
+fn home_dir() -> Option<OsString> {
+    resolve_home(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+/// Pure resolver for [`home_dir`] (kept env-free so it is unit-testable): prefer a
+/// non-empty `HOME`, else a non-empty `USERPROFILE`.
+fn resolve_home(
+    home: Option<impl AsRef<OsStr>>,
+    userprofile: Option<impl AsRef<OsStr>>,
+) -> Option<OsString> {
+    if let Some(home) = home {
+        if !home.as_ref().is_empty() {
+            return Some(home.as_ref().to_os_string());
+        }
+    }
+    userprofile
+        .filter(|u| !u.as_ref().is_empty())
+        .map(|u| u.as_ref().to_os_string())
+}
+
+/// Pure core of [`expand_tilde`]: expand `~`/`~/` against `home` when present,
+/// otherwise (no home resolvable) return the path unchanged rather than guessing.
+fn expand_tilde_with(path: &str, home: Option<OsString>) -> PathBuf {
     if path == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = home {
             return PathBuf::from(home);
         }
     } else if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = home {
             return Path::new(&home).join(rest);
         }
     }
@@ -341,5 +373,44 @@ mod tests {
         );
         assert_eq!(expand_tilde("~"), PathBuf::from("/home/tester"));
         assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+    }
+
+    #[test]
+    fn resolve_home_prefers_home_then_userprofile() {
+        // HOME wins outright when set (Unix/macOS).
+        assert_eq!(
+            resolve_home(Some("/home/a"), Some("C:\\Users\\a")),
+            Some(OsString::from("/home/a"))
+        );
+        // Empty HOME falls through to USERPROFILE (the Windows case).
+        assert_eq!(
+            resolve_home(Some(""), Some("C:\\Users\\a")),
+            Some(OsString::from("C:\\Users\\a"))
+        );
+        // Neither set → no home.
+        assert_eq!(resolve_home(None::<&str>, None::<&str>), None);
+    }
+
+    #[test]
+    fn expand_tilde_with_uses_home_or_leaves_path() {
+        // A `~/` path joins onto the resolved home (e.g. from USERPROFILE).
+        assert_eq!(
+            expand_tilde_with("~/.pwd-manager", Some(OsString::from("/home/x"))),
+            PathBuf::from("/home/x/.pwd-manager")
+        );
+        assert_eq!(
+            expand_tilde_with("~", Some(OsString::from("/home/x"))),
+            PathBuf::from("/home/x")
+        );
+        // With no home resolvable, the `~` path is returned unchanged, not guessed.
+        assert_eq!(
+            expand_tilde_with("~/.pwd-manager", None),
+            PathBuf::from("~/.pwd-manager")
+        );
+        // A non-`~` path is always returned verbatim.
+        assert_eq!(
+            expand_tilde_with("/abs/path", Some(OsString::from("/home/x"))),
+            PathBuf::from("/abs/path")
+        );
     }
 }
